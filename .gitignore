@@ -19,6 +19,10 @@ output/*.png
 output/*.log
 output/__pycache__/
 output/*.pyc
+# Archived subdirectories (timestamped CSV sets, dev snapshots)
+output/*/
+# Legacy toggle file, superseded by embed_phantom_raw config flag
+output/.build_viewer.py.disabled
 
 # Test-generated artifacts
 test/output/

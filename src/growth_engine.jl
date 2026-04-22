@@ -108,7 +108,8 @@ function grow_trees_mcp!(trees::Dict{String, GrowthTree}, domain;
         graph_points_cm::Union{Nothing, Matrix{Float64}}=nothing,
         use_gpu::Bool=gpu_available(),
         turn_penalty::Float64=0.5,
-        graph_jitter_cm::Float64=-1.0)
+        graph_jitter_cm::Float64=-1.0,
+        tree_weights::Union{Nothing, Dict{String, Float64}}=nothing)
 
     points_cm = coverage_points_cm === nothing ? _domain_points(domain) : coverage_points_cm
     route_points_cm = graph_points_cm === nothing ? points_cm : graph_points_cm
@@ -129,6 +130,32 @@ function grow_trees_mcp!(trees::Dict{String, GrowthTree}, domain;
     branch_names = sort(collect(keys(trees)))
     n_trees = length(branch_names)
     n_points = size(points_cm, 1)
+
+    # Normalize per-tree growth weights. Each tree's per-round batch is
+    # scaled by its normalized weight so that the total number of frontiers
+    # considered per round stays ≈ n_trees × frontier_batch (total throughput
+    # unchanged) but the split across trees reflects anatomical prior such
+    # as target flow (Q ∝ d^3 ∝ territory volume → bigger tree deserves more
+    # per-round growth).
+    raw_weights = Float64[]
+    for name in branch_names
+        w = tree_weights === nothing ? 1.0 : get(tree_weights, name, 1.0)
+        push!(raw_weights, max(w, 0.0))
+    end
+    total_raw_w = sum(raw_weights)
+    if total_raw_w <= 0.0
+        norm_weights = fill(1.0, n_trees)
+    else
+        # Normalize so weights sum to n_trees → per-tree factor ~1 on average
+        norm_weights = raw_weights .* (n_trees / total_raw_w)
+    end
+    per_tree_batch = [max(1, round(Int, frontier_batch * w)) for w in norm_weights]
+    tree_to_batch = Dict(branch_names[i] => per_tree_batch[i] for i in 1:n_trees)
+    if tree_weights !== nothing
+        println("[growth] tree_weights (normalized): " *
+                join(["$(branch_names[i])=$(round(norm_weights[i]; digits=3)) → batch=$(per_tree_batch[i])" for i in 1:n_trees], " "))
+        flush(stdout)
+    end
 
     # Build segment spatial indices for each tree
     seg_indices = Dict{String, SegmentSpatialIndex}()
@@ -195,7 +222,7 @@ function grow_trees_mcp!(trees::Dict{String, GrowthTree}, domain;
             total_added[name] >= max_new_branches_per_tree && continue
             tree = trees[name]
             remaining = max_new_branches_per_tree - total_added[name]
-            batch = min(frontier_batch, remaining)
+            batch = min(tree_to_batch[name], remaining)
 
             frontiers = _choose_competitive_frontiers(
                 global_min_dist, owner, ti, points_cm;

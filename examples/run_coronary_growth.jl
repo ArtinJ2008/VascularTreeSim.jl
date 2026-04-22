@@ -22,7 +22,7 @@ using Random
 # ══════════════════════════════════════════════════════════════
 # Configuration
 # ══════════════════════════════════════════════════════════════
-const CONFIG_PATH = joinpath(dirname(@__DIR__), "configs", "coronary.toml")
+const CONFIG_PATH = length(ARGS) >= 1 ? ARGS[1] : joinpath(dirname(@__DIR__), "configs", "coronary.toml")
 const OUTPUT_DIR = joinpath(dirname(@__DIR__), "output")
 const RUN_TIMESTAMP = Dates.format(Dates.now(), "yyyymmdd_HHMMSS")
 
@@ -237,6 +237,19 @@ println("  Coverage points: $(size(coverage_points, 1))")
 println("  Graph points: $(size(graph_points, 1))")
 flush(stdout)
 
+# Per-tree growth weights derived from target_flow_ml_min in config. Trees
+# with higher target flow grow faster per round, claim more competitive
+# territory, end with bigger subtrees. If no targets set, all trees
+# receive equal weight (original behavior).
+tree_weights = Dict{String, Float64}()
+for spec in config.vessel_trees
+    if spec.target_flow_ml_min > 0
+        tree_weights[spec.name] = spec.target_flow_ml_min
+    end
+end
+tree_weights_arg = isempty(tree_weights) ? nothing : tree_weights
+println("  tree_weights_arg = $(tree_weights_arg)"); flush(stdout)
+
 graph, territories, stats = grow_trees_mcp!(growth_trees, domain;
     coverage_points_cm=coverage_points, graph_points_cm=graph_points,
     effective_supply_radius_cm=config.effective_supply_radius_cm,
@@ -253,7 +266,8 @@ graph, territories, stats = grow_trees_mcp!(growth_trees, domain;
     target_p95_distance_cm=config.target_p95_distance_cm,
     target_max_distance_cm=config.target_max_distance_cm,
     turn_penalty=config.turn_penalty,
-    graph_jitter_cm=0.0)  # jitter already applied above
+    graph_jitter_cm=0.0,  # jitter already applied above
+    tree_weights=tree_weights_arg)
 
 for (name, st) in stats
     println("  $(name): $(st.added) grown + XCAT segments, $(st.terminals) terminals, p95=$(round(st.p95*10; digits=2))mm")
@@ -268,7 +282,9 @@ if config.subdivision_terminal_diameter_cm > 0.0 && config.subdivision_terminal_
         subdivide_terminals!(tree;
             target_diameter_cm=config.subdivision_terminal_diameter_cm,
             gamma=config.murray_gamma,
-            domain=domain)  # clip sub-branches that leave myocardium
+            max_ld_ratio=config.subdivision_max_ld_ratio,
+            clip_below_diameter_cm=config.subdivision_clip_below_diameter_cm,
+            domain=domain)
     end
     # Print diameter range after subdivision
     for (name, tree) in growth_trees
@@ -337,17 +353,20 @@ println("  $(summary_path)")
 # ══════════════════════════════════════════════════════════════
 # Step 5: Embed trees into vmale50 phantom → raw file
 # ══════════════════════════════════════════════════════════════
-println("\n[Step 5/5] Embedding trees into XCAT phantom...")
-flush(stdout)
-
 # Read phantom config from TOML (not in OrganConfig struct)
 using TOML
 toml_cfg = TOML.parsefile(CONFIG_PATH)
 phantom_path = get(get(toml_cfg, "organ", Dict()), "phantom_path", "")
 phantom_dims_arr = get(get(toml_cfg, "organ", Dict()), "phantom_dims", [1600, 1400, 500])
 ph_nx, ph_ny, ph_nz = Int(phantom_dims_arr[1]), Int(phantom_dims_arr[2]), Int(phantom_dims_arr[3])
+embed_phantom_raw = get(get(toml_cfg, "organ", Dict()), "embed_phantom_raw", true)
 
-if !isempty(phantom_path) && isfile(phantom_path)
+if !embed_phantom_raw
+    println("\n[Step 5/5] Skipping phantom embed (embed_phantom_raw=false in config)")
+    flush(stdout)
+elseif !isempty(phantom_path) && isfile(phantom_path)
+    println("\n[Step 5/5] Embedding trees into XCAT phantom...")
+    flush(stdout)
     println("  Loading phantom: $(phantom_path)")
     println("  Dims: $(ph_nx)×$(ph_ny)×$(ph_nz) = $(round(ph_nx*ph_ny*ph_nz/1024^2; digits=0)) MB")
     flush(stdout)

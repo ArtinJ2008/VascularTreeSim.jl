@@ -19,10 +19,17 @@ adequately perfused. Outputs include per-tree CSV segment files and an interacti
   `seed_point` (grow from scratch at user-specified coordinates).
 - **Competitive round-robin territory** -- multiple trees (e.g. LAD, LCX, RCA) grow
   simultaneously, each claiming the tissue closest to its existing branches.
-- **Strict Murray-derived diameters** -- every segment diameter (XCAT and grown) is
-  recomputed as `d = d_term × N^(1/γ)` from its subtree terminal count, so Murray's
-  law is satisfied globally, not only at the branch being added. The XCAT ostium
-  diameter acts only as a capacity ceiling via a per-tree terminal budget.
+- **Anatomically-weighted per-round growth** -- each tree's per-round frontier batch
+  scales with a `target_flow_ml_min` prior declared under `[[vessel_trees]]`. A
+  tree with a higher target flow (e.g. LAD at 242 mL/min) grows faster per round
+  than a smaller-territory tree (e.g. LCX at 116 mL/min), producing sub-terminal
+  counts that match anatomical flow-demand ratios. Omit the field for unweighted
+  (uniform) growth, matching the prior behavior.
+- **Max-anatomy Murray diameters** -- grown segments are sized strictly by
+  `d = d_term × N^(1/γ)`; XCAT-derived segments keep `max(NRB-measured, Murray)` so
+  the measured ostium/proximal diameters are preserved even when Murray alone
+  would predict a thinner vessel. This avoids collapsing the XCAT root when the
+  subtree is small.
 - **Hybrid growth + subdivision pipeline** -- grow first to a realistic 200 μm
   terminal, then recursively bifurcate each tip to 8 μm capillaries. This produces
   physiological root diameters (mm-scale) and true capillary counts (tens of
@@ -158,7 +165,10 @@ CSV files  +  HTML viewer
 |---|---|---|
 | `name` | `String` | Organ identifier (e.g. `"coronary"`) |
 | `nrb_path` | `String` | Absolute path to the XCAT `.nrb` file |
+| `phantom_path` | `String` | Absolute path to the `.raw` XCAT phantom volume (optional — only read if `embed_phantom_raw = true`) |
+| `phantom_dims` | `[Int, Int, Int]` | `(nx, ny, nz)` voxel dimensions of the raw phantom |
 | `coordinate_scale` | `Float64` | Multiplier converting NRB coordinates to cm (default `0.1` for mm-to-cm) |
+| `embed_phantom_raw` | `Bool` | If `true`, Step 5 embeds the grown trees into the XCAT raw volume and writes `vmale50_with_grown_coronaries.raw` (~1 GB). Default `true` for backward compatibility; set `false` when you only need the CSV output. |
 
 ### `[surfaces]`
 
@@ -176,6 +186,7 @@ CSV files  +  HTML viewer
 | `surface_names` | `Array{String}` | XCAT surface names belonging to this tree |
 | `color` | `String` | Hex color for the viewer (default `"#888888"`) |
 | `root_anchor_surface` | `String` | Surface used to anchor the tree root (e.g. `"dias_aorta"`) |
+| `target_flow_ml_min` | `Float64` | Optional anatomical prior used as a per-round growth weight. When any tree sets this, the per-round frontier batch for tree `i` is scaled by `target_i / (Σ target) × n_trees` so that sub-terminal counts match anatomical flow-demand ratios. Default `0.0` (unweighted). |
 
 ### `[domain]`
 
@@ -196,6 +207,8 @@ CSV files  +  HTML viewer
 | `capillary_diameter_cm` | `Float64` | `0.0008` | Terminal (capillary) diameter cutoff (legacy; use `terminal_diameter_cm`) |
 | `terminal_diameter_cm` | `Float64` | `capillary_diameter_cm` | Murray-strict terminal (leaf) diameter for the growth phase. Root diameter scales as `d_term × N_terminals^(1/γ)`. |
 | `subdivision_terminal_diameter_cm` | `Float64` | `0.0` | If > 0 and < `terminal_diameter_cm`, run post-growth recursive bifurcation on every terminal until segment diameter reaches this value. `0` disables subdivision. |
+| `subdivision_max_ld_ratio` | `Float64` | `25.0` | Post-Murray re-length pass: any segment whose `L/d` exceeds this threshold is split axially into shorter pieces at the same diameter, preserving Murray while eliminating long-thin bottlenecks created when downstream domain clipping shrinks the effective terminal count. Set to `0` to skip. |
+| `subdivision_clip_below_diameter_cm` | `Float64` | `0.0` | Only domain-clip sub-branches whose child diameter is below this threshold. Larger sub-branches are allowed to extend outside the myocardial shell (matching real epicardial-vessel anatomy). `0` disables the exemption (all sub-branches are clipped). |
 | `max_new_branches_per_tree` | `Int` | `220` | Maximum branches to add per tree |
 | `graph_neighbors` | `Int` | `12` | k for the k-nearest-neighbor domain graph |
 | `min_frontier_separation_cm` | `Float64` | `0.18` | Minimum spacing between frontier targets in a batch |

@@ -5,9 +5,10 @@
 [organ]
 name = "coronary"
 nrb_path = "/home/molloi-lab/smb_mount/shared_drive/XCAT Phantom/xcat_adult_nrb_files/vmale50_heart.nrb"
-phantom_path = "/home/molloi-lab/smb_mount/shared_drive/shu_nie/PVAT_Analysis/digital phantoms/vmale50_1600x1400x500_8bit_little_endian_act_1.raw"
+phantom_path = "/home/molloi-lab/smb_mount/shared_drive/Shu Nie/PVAT_Analysis/digital phantoms/vmale50_1600x1400x500_8bit_little_endian_act_1.raw"
 phantom_dims = [1600, 1400, 500]
 coordinate_scale = 0.1  # XCAT NRB uses mm, we work in cm
+embed_phantom_raw = false  # Step 5 (embed grown trees into XCAT raw volume). Costs ~5 min + 1 GB raw file. Set true if the raw output is actually consumed downstream (we currently only use the CSV output).
 
 [surfaces]
 outer = "dias_pericardium"
@@ -36,18 +37,21 @@ name = "LAD"
 surface_names = ["dias_lad1", "dias_lad2", "dias_lad3"]
 color = "#1f77ff"
 root_anchor_surface = "dias_aorta"
+target_flow_ml_min = 242.0   # anatomical prior for per-round growth weight (competitive territory allocation)
 
 [[vessel_trees]]
 name = "LCX"
 surface_names = ["dias_lcx"]
 color = "#e3342f"
 root_anchor_surface = "dias_aorta"
+target_flow_ml_min = 116.0
 
 [[vessel_trees]]
 name = "RCA"
 surface_names = ["dias_rca1", "dias_rca2"]
 color = "#22aa44"
 root_anchor_surface = "dias_aorta"
+target_flow_ml_min = 214.0
 
 [domain]
 voxel_spacing_cm = 0.02         # Fine resolution (v5 fine run)
@@ -61,7 +65,9 @@ mode = "continue_from_xcat"     # Continue from existing XCAT LAD/LCX/RCA
 effective_supply_radius_cm = 0.00125   # 12.5 μm
 capillary_diameter_cm = 0.0008         # 8 μm  (legacy: kept for backwards compat)
 terminal_diameter_cm = 0.02            # 200 μm — Murray-strict terminal (leaf) diameter for growth phase
-subdivision_terminal_diameter_cm = 0.0008  # 8 μm — recursive bifurcation of terminals to capillary level
+subdivision_terminal_diameter_cm = 0.0008   # 8 μm — recursive bifurcation of terminals to capillary level
+subdivision_clip_below_diameter_cm = 0.005  # only clip sub-branches at arteriole scale (<50 μm); larger sub-branches allowed to extend outside myocardium (cf. real epicardial anatomy)
+subdivision_max_ld_ratio = 25.0             # post-subdivision safety net: split any residual L/d > 25 segment into shorter pieces at the same diameter
 max_new_branches_per_tree = 200000     # very large cap — real stop is Murray budget exhaustion / coverage
 graph_neighbors = 16                   # v5 fine run
 min_frontier_separation_cm = 0.015     # v5 fine run

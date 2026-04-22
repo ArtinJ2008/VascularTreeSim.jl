@@ -11,6 +11,7 @@ struct VesselTreeSpec
     surface_names::Vector{String}
     color::String
     root_anchor_surface::String
+    target_flow_ml_min::Float64  # anatomical prior used as per-tree growth weight (0 = unweighted uniform growth)
 end
 
 struct OrganConfig
@@ -40,6 +41,8 @@ struct OrganConfig
     capillary_diameter_cm::Float64
     terminal_diameter_cm::Float64   # Murray-strict terminal (leaf) diameter — all grown leaves at this size
     subdivision_terminal_diameter_cm::Float64  # final terminal diameter after recursive subdivision (0 = no subdivision)
+    subdivision_max_ld_ratio::Float64  # post-subdivision re-length pass: split segments with L/d > this threshold (0 = skip)
+    subdivision_clip_below_diameter_cm::Float64  # only domain-clip sub-branches with child diameter < this (0 = clip all, matching pre-A2 behavior)
     max_new_branches_per_tree::Int
     graph_neighbors::Int
     min_frontier_separation_cm::Float64
@@ -83,6 +86,7 @@ function load_organ_config(path::AbstractString)
             Vector{String}(vt["surface_names"]),
             get(vt, "color", "#888888"),
             get(vt, "root_anchor_surface", ""),
+            Float64(get(vt, "target_flow_ml_min", 0.0)),
         ))
     end
 
@@ -106,6 +110,8 @@ function load_organ_config(path::AbstractString)
     # Default terminal_diameter_cm to capillary_diameter_cm if not specified — backwards compat
     terminal_diameter_cm = get(gr, "terminal_diameter_cm", capillary_diameter_cm)
     subdivision_terminal_diameter_cm = get(gr, "subdivision_terminal_diameter_cm", 0.0)
+    subdivision_max_ld_ratio = get(gr, "subdivision_max_ld_ratio", 25.0)
+    subdivision_clip_below_diameter_cm = get(gr, "subdivision_clip_below_diameter_cm", 0.0)
     max_new_branches_per_tree = get(gr, "max_new_branches_per_tree", 220)
     graph_neighbors = get(gr, "graph_neighbors", 12)
     min_frontier_separation_cm = get(gr, "min_frontier_separation_cm", 0.18)
@@ -135,6 +141,7 @@ function load_organ_config(path::AbstractString)
         vessel_trees, reference_surface,
         voxel_spacing_cm, outer_samples, cavity_samples, dilation_radius, coarse_seed_cm,
         growth_mode, effective_supply_radius_cm, capillary_diameter_cm, terminal_diameter_cm, subdivision_terminal_diameter_cm,
+        subdivision_max_ld_ratio, subdivision_clip_below_diameter_cm,
         max_new_branches_per_tree, graph_neighbors, min_frontier_separation_cm,
         max_path_nodes, frontier_batch, murray_gamma, max_segment_length_cm,
         smooth_passes, spline_density, coverage_stride, graph_stride, graph_jitter_cm, turn_penalty,

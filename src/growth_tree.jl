@@ -463,6 +463,8 @@ function subdivide_terminals!(tree::GrowthTree;
         gamma::Float64=3.0,
         branch_half_angle::Float64=0.4,
         ld_ratio::Float64=12.0,
+        max_ld_ratio::Float64=25.0,
+        clip_below_diameter_cm::Float64=0.0,
         domain::Union{Nothing, VoxelShellDomain}=nothing)
 
     target_diameter_cm >= tree.terminal_diameter_cm && return nothing
@@ -487,7 +489,8 @@ function subdivide_terminals!(tree::GrowthTree;
         dir = dir / len
 
         _subdivide_recursive!(tree, tip_v, d_cm, dir, target_diameter_cm, gamma,
-                              branch_half_angle, ld_ratio, rng, domain, clipped)
+                              branch_half_angle, ld_ratio, rng, domain, clipped,
+                              clip_below_diameter_cm)
     end
 
     # Recompute terminal counts and diameters for the ENTIRE tree
@@ -498,17 +501,131 @@ function subdivide_terminals!(tree::GrowthTree;
     clip_msg = domain === nothing ? "" : " (clipped $(clipped[]) out-of-domain sub-branches)"
     println("[subdivide] $(tree.name): $(length(terminals)) terminals → $(n_new_terminals) sub-terminals, $(n_after - n_before) new vertices$(clip_msg)")
     flush(stdout)
+
+    # Re-length thin-long segments. Domain clipping removes subtrees, which then
+    # lets _recompute_all_murray! shrink upstream segment diameters based on the
+    # surviving leaf count. The SEGMENT LENGTH was fixed at creation time from
+    # the original (larger) child diameter, so post-recompute a 7 mm segment
+    # can end up with an 8 μm diameter — L/d ≈ 800, Poiseuille resistance ∝ L/r⁴
+    # then creates a single-segment bottleneck that dominates the whole path.
+    # Splitting such segments along their axis into pieces at the new diameter
+    # restores physically reasonable geometry (Murray stays satisfied because d
+    # is unchanged across the pieces).
+    if max_ld_ratio > 0.0
+        n_split, n_new_segs = _relength_thin_segments!(tree; max_ld_ratio=max_ld_ratio)
+        if n_split > 0
+            println("[relength] $(tree.name): split $(n_split) segments → $(n_new_segs) new segments (max L/d = $(round(max_ld_ratio, digits=1)))")
+            flush(stdout)
+        end
+    end
+
     return nothing
+end
+
+"""
+    _relength_thin_segments!(tree; max_ld_ratio)
+
+Iterate over every segment; for each with `length / diameter > max_ld_ratio`,
+split it into `N = ceil((L/d) / max_ld_ratio)` equal-length pieces along its
+straight axis. All pieces inherit the original diameter (so Murray's law is
+preserved — diameter is determined by downstream terminal count, which is
+unchanged by this split). Iteration uses a snapshot of the original segment
+count so newly inserted pieces are not themselves re-split (they can't be:
+each has L/d ≤ max_ld_ratio by construction).
+"""
+function _relength_thin_segments!(tree::GrowthTree; max_ld_ratio::Float64)
+    n_before = length(tree.segment_start)
+    n_split = 0
+    n_new_segs = 0
+    for s in 1:n_before
+        a_idx = tree.segment_start[s]
+        b_idx = tree.segment_end[s]
+        a = tree.vertices[a_idx]
+        b = tree.vertices[b_idx]
+        L = norm(b - a)
+        d = tree.segment_diameter_cm[s]
+        (L <= 0.0 || d <= 0.0) && continue
+        ratio = L / d
+        ratio <= max_ld_ratio && continue
+
+        N = Int(ceil(ratio / max_ld_ratio))   # N pieces, each L/N long
+        N < 2 && continue
+
+        step = (b - a) / N  # SVector{3,Float64}
+        label = tree.segment_label[s]
+        is_xcat = tree.is_xcat[s]
+        subtree_count_end = tree.subtree_terminal_count[b_idx]
+
+        # Remove b_idx from a_idx's children list — we'll chain through new vertices
+        pos_in_children = findfirst(==(b_idx), tree.children[a_idx])
+        pos_in_children !== nothing && deleteat!(tree.children[a_idx], pos_in_children)
+
+        prev_v = a_idx
+        for k in 1:(N - 1)
+            new_pos = a + k * step
+            push!(tree.vertices, new_pos)
+            new_v = length(tree.vertices)
+            push!(tree.parent_vertex, prev_v)
+            push!(tree.children, Int[])
+            push!(tree.incoming_segment, 0)
+            push!(tree.subtree_terminal_count, subtree_count_end)
+
+            if k == 1
+                # First piece: redirect original segment s to end at new_v
+                tree.segment_end[s] = new_v
+                tree.incoming_segment[new_v] = s
+                push!(tree.children[a_idx], new_v)
+            else
+                # Subsequent pieces: new segment prev_v → new_v
+                push!(tree.segment_start, prev_v)
+                push!(tree.segment_end, new_v)
+                push!(tree.segment_diameter_cm, d)
+                push!(tree.segment_label, label)
+                push!(tree.is_xcat, is_xcat)
+                new_seg = length(tree.segment_start)
+                tree.incoming_segment[new_v] = new_seg
+                push!(tree.children[prev_v], new_v)
+                n_new_segs += 1
+            end
+            prev_v = new_v
+        end
+
+        # Final piece: prev_v → b_idx (reuse existing b_idx, just reconnect)
+        push!(tree.segment_start, prev_v)
+        push!(tree.segment_end, b_idx)
+        push!(tree.segment_diameter_cm, d)
+        push!(tree.segment_label, label)
+        push!(tree.is_xcat, is_xcat)
+        new_seg = length(tree.segment_start)
+        tree.incoming_segment[b_idx] = new_seg
+        tree.parent_vertex[b_idx] = prev_v
+        push!(tree.children[prev_v], b_idx)
+        n_new_segs += 1
+
+        n_split += 1
+    end
+    return (n_split, n_new_segs)
 end
 
 function _subdivide_recursive!(tree::GrowthTree, vertex::Int, parent_d_cm::Float64,
         direction::SVector{3,Float64}, target_d_cm::Float64, gamma::Float64,
         half_angle::Float64, ld_ratio::Float64, rng::Random.AbstractRNG,
         domain::Union{Nothing, VoxelShellDomain}=nothing,
-        clipped::Union{Nothing, Ref{Int}}=nothing)
+        clipped::Union{Nothing, Ref{Int}}=nothing,
+        clip_below_diameter_cm::Float64=0.0)
 
     child_d_cm = parent_d_cm / 2.0^(1.0 / gamma)
     child_d_cm <= target_d_cm && return
+
+    # Domain clipping policy: only enforce domain containment for sub-branches
+    # below `clip_below_diameter_cm`. Rationale: large epicardial vessels
+    # naturally sit on/outside the myocardial shell in real anatomy; forcing
+    # them into the shell causes cascading Murray-recompute artifacts where a
+    # segment's length stays fixed but its diameter shrinks based on surviving
+    # subtree terminals, yielding L/d > 100 bottlenecks. Only intramural
+    # arterioles/capillaries (small diameter) must be contained.
+    apply_clip = domain !== nothing &&
+                 (clip_below_diameter_cm <= 0.0 || child_d_cm < clip_below_diameter_cm)
 
     # Two perpendicular vectors to direction
     u, v = _perp_pair(direction)
@@ -516,20 +633,20 @@ function _subdivide_recursive!(tree::GrowthTree, vertex::Int, parent_d_cm::Float
     seg_len = child_d_cm * ld_ratio
     origin = tree.vertices[vertex]
 
-    # Try multiple random rotations of bifurcation plane; pick the one where the
-    # most children land inside the domain. Prevents cascading subtree loss when
-    # a single random plane happens to straddle the domain boundary.
+    # When clipping is active, try multiple random rotations and pick the
+    # orientation that keeps the most children inside the domain. Otherwise
+    # one random rotation is enough.
     dir1 = SVector(0.0, 0.0, 0.0)
     dir2 = SVector(0.0, 0.0, 0.0)
     best_score = -1
-    max_attempts = domain === nothing ? 1 : 8
+    max_attempts = apply_clip ? 8 : 1
     for attempt in 1:max_attempts
         theta = rand(rng) * 2π
         perp = cos(theta) * u + sin(theta) * v
         c1 = LinearAlgebra.normalize(direction + t * perp)
         c2 = LinearAlgebra.normalize(direction - t * perp)
         score = 2
-        if domain !== nothing
+        if apply_clip
             score = (point_in_domain(domain, origin + seg_len * c1) ? 1 : 0) +
                     (point_in_domain(domain, origin + seg_len * c2) ? 1 : 0)
         end
@@ -544,8 +661,8 @@ function _subdivide_recursive!(tree::GrowthTree, vertex::Int, parent_d_cm::Float
         new_pos = origin + seg_len * child_dir
 
         # Domain clip: reject sub-branches that leave the myocardial shell.
-        # The remaining Murray recompute handles diameter adjustments automatically.
-        if domain !== nothing && !point_in_domain(domain, new_pos)
+        # Only applies below clip_below_diameter_cm (see apply_clip above).
+        if apply_clip && !point_in_domain(domain, new_pos)
             clipped !== nothing && (clipped[] += 1)
             continue
         end
@@ -564,7 +681,8 @@ function _subdivide_recursive!(tree::GrowthTree, vertex::Int, parent_d_cm::Float
         push!(tree.children[vertex], vid)
 
         _subdivide_recursive!(tree, vid, child_d_cm, child_dir, target_d_cm, gamma,
-                              half_angle, ld_ratio, rng, domain, clipped)
+                              half_angle, ld_ratio, rng, domain, clipped,
+                              clip_below_diameter_cm)
     end
 end
 
@@ -617,8 +735,21 @@ function _recompute_all_murray!(tree::GrowthTree; target_diameter_cm::Float64, g
         end
         seg = tree.incoming_segment[v]
         if seg != 0
+            # Use max(anatomy_d, murray_d). XCAT-labeled segments have their
+            # NRB-measured diameters from growth_tree_from_xcat; those may be
+            # bigger than what Murray alone would compute (proximal vessels
+            # over-provisioned in real anatomy) or smaller (distal tapering or
+            # NRB-surface discontinuities between dias_lad2 end and dias_lad3
+            # start). Taking max avoids two failure modes at once:
+            #   • shrinking 5 mm ostium to the Murray-required 2 mm
+            #     → 6× root Poiseuille R, flow chokes at root
+            #   • leaving a 0.6 mm distal XCAT bottleneck intact
+            #     → flow chokes at the XCAT→grown junction
+            # For grown/subdivided segments (is_xcat=false), murray_d is the
+            # authoritative value by design, so max() just recovers that.
             n = tree.subtree_terminal_count[v]
-            tree.segment_diameter_cm[seg] = target_diameter_cm * n^(1.0 / gamma)
+            murray_d = target_diameter_cm * n^(1.0 / gamma)
+            tree.segment_diameter_cm[seg] = max(tree.segment_diameter_cm[seg], murray_d)
         end
     end
 
