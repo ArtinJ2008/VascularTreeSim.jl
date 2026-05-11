@@ -28,15 +28,25 @@ function _surface_sample_matrices(surface::XCATNurbsSurface; n_u::Int, n_v::Int,
 end
 
 # ── Territory assignment (competitive, THREADED) ──
+#
+# `global_min_dist` stores the EFFECTIVE distance (raw / territory_weight).
+# A tree claims a point when its effective distance beats the incumbent's.
+# Weight = 1.0 (default) reduces to pure-geometric ownership (original
+# behavior); larger weight lets a tree claim more distant points, which
+# produces weighted-Voronoi-like territory proportional to weight³ in 3D.
+# Supply-radius and p95 thresholds are in raw distance, so callers must
+# multiply by owner's weight when comparing to a physical threshold.
 
 function _update_global_min_distances_threaded!(global_min_dist::Vector{Float64}, owner::Vector{Int},
                                                 points_cm::Matrix{Float64}, seg_idx::SegmentSpatialIndex,
-                                                tree_idx::Int)
+                                                tree_idx::Int; weight::Float64=1.0)
     n = size(points_cm, 1)
+    inv_w = 1.0 / weight
     Threads.@threads for i in 1:n
-        d = _indexed_segment_distance(seg_idx, points_cm[i, 1], points_cm[i, 2], points_cm[i, 3])
-        if d < global_min_dist[i]
-            global_min_dist[i] = d
+        d_raw = _indexed_segment_distance(seg_idx, points_cm[i, 1], points_cm[i, 2], points_cm[i, 3])
+        d_eff = d_raw * inv_w
+        if d_eff < global_min_dist[i]
+            global_min_dist[i] = d_eff
             owner[i] = tree_idx
         end
     end
@@ -45,16 +55,19 @@ end
 # Fallback for incremental update with new segments only (SoA fast path)
 function _update_global_min_distances_incremental!(global_min_dist::Vector{Float64}, owner::Vector{Int},
                                                     points_cm::Matrix{Float64}, seg_idx::SegmentSpatialIndex,
-                                                    tree_idx::Int, seg_start::Int, seg_end::Int)
+                                                    tree_idx::Int, seg_start::Int, seg_end::Int;
+                                                    weight::Float64=1.0)
     n = size(points_cm, 1)
+    inv_w = 1.0 / weight
     Threads.@threads for i in 1:n
         best_d = global_min_dist[i]
         best_owner = owner[i]
         for s in seg_start:seg_end
             d2 = _point_seg_dist2(seg_idx, s, points_cm[i, 1], points_cm[i, 2], points_cm[i, 3])
-            d = sqrt(d2)
-            if d < best_d
-                best_d = d
+            d_raw = sqrt(d2)
+            d_eff = d_raw * inv_w
+            if d_eff < best_d
+                best_d = d_eff
                 best_owner = tree_idx
             end
         end
@@ -66,13 +79,17 @@ end
 function _choose_competitive_frontiers(global_min_dist::Vector{Float64}, owner::Vector{Int},
                                         tree_idx::Int, points_cm::Matrix{Float64};
                                         max_targets::Int, min_separation_cm::Float64,
-                                        effective_supply_radius_cm::Float64)
+                                        effective_supply_radius_cm::Float64,
+                                        weight::Float64=1.0)
+    # global_min_dist is EFFECTIVE distance (raw * 1/weight_owner). Since all
+    # points here have owner == tree_idx, multiply by `weight` to recover raw.
+    # Supply-radius comparison is in raw cm.
     scored = Tuple{Float64, Int}[]
     for i in eachindex(global_min_dist)
         owner[i] == tree_idx || continue
-        d = global_min_dist[i]
-        d <= effective_supply_radius_cm && continue
-        push!(scored, (d, i))
+        d_raw = global_min_dist[i] * weight
+        d_raw <= effective_supply_radius_cm && continue
+        push!(scored, (d_raw, i))
     end
     sort!(scored, by=first, rev=true)
     chosen = Int[]
@@ -109,7 +126,8 @@ function grow_trees_mcp!(trees::Dict{String, GrowthTree}, domain;
         use_gpu::Bool=gpu_available(),
         turn_penalty::Float64=0.5,
         graph_jitter_cm::Float64=-1.0,
-        tree_weights::Union{Nothing, Dict{String, Float64}}=nothing)
+        tree_weights::Union{Nothing, Dict{String, Float64}}=nothing,
+        territory_weights::Union{Nothing, Dict{String, Float64}}=nothing)
 
     points_cm = coverage_points_cm === nothing ? _domain_points(domain) : coverage_points_cm
     route_points_cm = graph_points_cm === nothing ? points_cm : graph_points_cm
@@ -157,6 +175,26 @@ function grow_trees_mcp!(trees::Dict{String, GrowthTree}, domain;
         flush(stdout)
     end
 
+    # Per-tree territory weights drive weighted-Voronoi ownership: a tree
+    # with weight w claims points up to w times farther (in raw distance)
+    # than a unit-weight competitor, yielding territory volume ∝ w^3.
+    # Without territory_weights, all w=1 (geometric Voronoi = original).
+    territory_w_arr = Float64[
+        territory_weights === nothing ? 1.0 :
+            max(get(territory_weights, name, 1.0), 1e-9)
+        for name in branch_names
+    ]
+    # Normalize so max weight = 1, keeping effective distances in a sane range.
+    max_w = maximum(territory_w_arr)
+    if max_w > 0
+        territory_w_arr ./= max_w
+    end
+    if territory_weights !== nothing
+        println("[growth] territory_weights (normalized, max=1): " *
+                join(["$(branch_names[i])=$(round(territory_w_arr[i]; digits=3))" for i in 1:n_trees], " "))
+        flush(stdout)
+    end
+
     # Build segment spatial indices for each tree
     seg_indices = Dict{String, SegmentSpatialIndex}()
     for name in branch_names
@@ -172,10 +210,11 @@ function grow_trees_mcp!(trees::Dict{String, GrowthTree}, domain;
         gpu_state = _gpu_init_distance_state(points_cm)
         for (ti, name) in enumerate(branch_names)
             tree = trees[name]
+            w_ti = territory_w_arr[ti]
             if isempty(tree.segment_start)
-                _gpu_seed_distance!(gpu_state, tree.vertices[tree.root_vertex], ti)
+                _gpu_seed_distance!(gpu_state, tree.vertices[tree.root_vertex], ti; weight=w_ti)
             else
-                _gpu_full_distance_scan!(gpu_state, seg_indices[name], ti)
+                _gpu_full_distance_scan!(gpu_state, seg_indices[name], ti; weight=w_ti)
             end
         end
         global_min_dist, owner = _gpu_download_distances(gpu_state)
@@ -185,20 +224,27 @@ function grow_trees_mcp!(trees::Dict{String, GrowthTree}, domain;
         owner = fill(0, n_points)
         for (ti, name) in enumerate(branch_names)
             tree = trees[name]
+            w_ti = territory_w_arr[ti]
+            inv_w = 1.0 / w_ti
             if isempty(tree.segment_start)
                 rv = tree.vertices[tree.root_vertex]
                 Threads.@threads for i in 1:n_points
-                    d = sqrt((points_cm[i,1]-rv[1])^2 + (points_cm[i,2]-rv[2])^2 + (points_cm[i,3]-rv[3])^2)
-                    if d < global_min_dist[i]
-                        global_min_dist[i] = d
+                    d_raw = sqrt((points_cm[i,1]-rv[1])^2 + (points_cm[i,2]-rv[2])^2 + (points_cm[i,3]-rv[3])^2)
+                    d_eff = d_raw * inv_w
+                    if d_eff < global_min_dist[i]
+                        global_min_dist[i] = d_eff
                         owner[i] = ti
                     end
                 end
             else
-                _update_global_min_distances_threaded!(global_min_dist, owner, points_cm, seg_indices[name], ti)
+                _update_global_min_distances_threaded!(global_min_dist, owner, points_cm, seg_indices[name], ti; weight=w_ti)
             end
         end
     end
+
+    # Helper: raw distance at point i (undoing the effective-distance storage).
+    # Points with owner=0 (unclaimed — shouldn't happen after init) use raw=Inf.
+    raw_dist_at(i) = owner[i] > 0 ? global_min_dist[i] * territory_w_arr[owner[i]] : Inf
 
     println("[growth] initial global distance scan: $(round(time()-t_init; digits=2))s  points=$(n_points)")
     flush(stdout)
@@ -214,26 +260,42 @@ function grow_trees_mcp!(trees::Dict{String, GrowthTree}, domain;
     stall_rounds = 0
     max_stall_rounds = 20   # stop if p95 hasn't improved in this many rounds
 
+    # Per-tree saturation tracking. Each tree's p95 is computed over its own
+    # owned points (raw distance). When a tree's p95 stalls for max_stall_rounds
+    # rounds, that tree is marked saturated and skipped in subsequent rounds.
+    # This prevents fast-territory trees (small Voronoi cell) from "catching
+    # up" by stretching into already-filled regions while slow-territory trees
+    # (big Voronoi cell) are still genuinely improving — the observed effect
+    # that previously equalized terminal counts despite weighted-Voronoi
+    # initial territory differences.
+    tree_best_p95 = Dict(name => Inf for name in branch_names)
+    tree_stall = Dict(name => 0 for name in branch_names)
+    tree_saturated = Dict(name => false for name in branch_names)
+
     while true
         round_num += 1
         round_progress = false
 
         for (ti, name) in enumerate(branch_names)
+            tree_saturated[name] && continue
             total_added[name] >= max_new_branches_per_tree && continue
             tree = trees[name]
             remaining = max_new_branches_per_tree - total_added[name]
             batch = min(tree_to_batch[name], remaining)
 
+            w_ti = territory_w_arr[ti]
             frontiers = _choose_competitive_frontiers(
                 global_min_dist, owner, ti, points_cm;
                 max_targets=batch, min_separation_cm=min_frontier_separation_cm,
-                effective_supply_radius_cm=effective_supply_radius_cm)
+                effective_supply_radius_cm=effective_supply_radius_cm,
+                weight=w_ti)
             isempty(frontiers) && continue
 
             seg_before = length(tree.segment_start)
             local_added = 0
             for idx in frontiers
-                global_min_dist[idx] <= effective_supply_radius_cm && continue
+                # global_min_dist is effective; compare raw against supply radius
+                (global_min_dist[idx] * w_ti) <= effective_supply_radius_cm && continue
                 p = SVector(points_cm[idx, 1], points_cm[idx, 2], points_cm[idx, 3])
                 anchor_vertex, anchor_point = _choose_anchor_vertex(tree, p)
                 source_idx, _ = _nearest_graph_index(sgrid, anchor_point)
@@ -257,23 +319,52 @@ function grow_trees_mcp!(trees::Dict{String, GrowthTree}, domain;
                 seg_indices[name] = update_segment_index!(seg_indices[name], tree, seg_before + 1)
                 if use_gpu && gpu_state !== nothing
                     # GPU incremental: scan only new segments on device
-                    _gpu_incremental_scan!(gpu_state, seg_indices[name], ti, seg_before + 1, seg_after)
+                    _gpu_incremental_scan!(gpu_state, seg_indices[name], ti, seg_before + 1, seg_after; weight=w_ti)
                     global_min_dist, owner = _gpu_download_distances(gpu_state)
                 else
                     # CPU incremental: threaded scan of new segments
                     _update_global_min_distances_incremental!(global_min_dist, owner, points_cm,
-                        seg_indices[name], ti, seg_before + 1, seg_after)
+                        seg_indices[name], ti, seg_before + 1, seg_after; weight=w_ti)
                 end
             end
         end
 
-        # Status report
-        current_p95 = quantile(global_min_dist, 0.95)
-        current_max = maximum(global_min_dist)
+        # Status report (convert effective → raw for p95/max so physical
+        # thresholds and stall detection remain in cm).
+        raw_dists = [raw_dist_at(i) for i in 1:n_points]
+        current_p95 = quantile(raw_dists, 0.95)
+        current_max = maximum(raw_dists)
+
+        # Per-tree p95 + saturation update. Compute p95 over owned points
+        # only, advance per-tree stall counter, mark tree saturated when its
+        # local stall reaches the threshold.
+        per_tree_p95 = Float64[]
+        for (ti, name) in enumerate(branch_names)
+            tree_saturated[name] && (push!(per_tree_p95, tree_best_p95[name]); continue)
+            owned_dists = Float64[]
+            for i in 1:n_points
+                owner[i] == ti && push!(owned_dists, raw_dists[i])
+            end
+            tree_p95 = isempty(owned_dists) ? Inf : quantile(owned_dists, 0.95)
+            push!(per_tree_p95, tree_p95)
+            if tree_p95 < tree_best_p95[name] - 1e-6
+                tree_best_p95[name] = tree_p95
+                tree_stall[name] = 0
+            else
+                tree_stall[name] += 1
+            end
+            if round_num > 10 && tree_stall[name] >= max_stall_rounds
+                tree_saturated[name] = true
+                println("[growth] $(name) saturated: p95 stalled at $(round(tree_best_p95[name]; digits=5)) cm after $(total_added[name]) branches")
+                flush(stdout)
+            end
+        end
+
         if round_num <= 3 || round_num % 5 == 0
             territory_counts = join(["$(branch_names[ti])=$(count(==(ti), owner))" for ti in 1:n_trees], " ")
             added_str = join(["$(name)=$(total_added[name])" for name in branch_names], " ")
-            println("[growth] round=$(round_num) added=[$(added_str)] p95=$(round(current_p95; digits=5)) max=$(round(current_max; digits=5)) territory=[$(territory_counts)]")
+            tree_p95_str = join(["$(branch_names[ti])=$(round(per_tree_p95[ti]; digits=4))" for ti in 1:n_trees], " ")
+            println("[growth] round=$(round_num) added=[$(added_str)] global_p95=$(round(current_p95; digits=5)) tree_p95=[$(tree_p95_str)] territory=[$(territory_counts)]")
             flush(stdout)
         end
 
@@ -281,8 +372,9 @@ function grow_trees_mcp!(trees::Dict{String, GrowthTree}, domain;
         all_maxed = all(total_added[name] >= max_new_branches_per_tree for name in branch_names)
         p95_ok = isfinite(target_p95_distance_cm) && current_p95 <= target_p95_distance_cm
         max_ok = isfinite(target_max_distance_cm) && current_max <= target_max_distance_cm
+        all_saturated = all(values(tree_saturated))
 
-        # Stall detection: stop if p95 hasn't improved in max_stall_rounds
+        # Global stall detection (fallback for unweighted runs / sanity check)
         if current_p95 < best_p95 - 1e-6
             best_p95 = current_p95
             stall_rounds = 0
@@ -291,12 +383,15 @@ function grow_trees_mcp!(trees::Dict{String, GrowthTree}, domain;
         end
         coverage_stalled = stall_rounds >= max_stall_rounds
 
-        if coverage_stalled && round_num > 10
-            println("[growth] STOP: p95 stalled at $(round(best_p95; digits=5)) cm for $(stall_rounds) rounds")
+        if all_saturated
+            println("[growth] STOP: all trees saturated (per-tree p95 stalled)")
+            flush(stdout)
+        elseif coverage_stalled && round_num > 10
+            println("[growth] STOP: global p95 stalled at $(round(best_p95; digits=5)) cm for $(stall_rounds) rounds")
             flush(stdout)
         end
 
-        (all_maxed || (p95_ok && max_ok) || !round_progress || (coverage_stalled && round_num > 10)) && break
+        (all_saturated || all_maxed || (p95_ok && max_ok) || !round_progress || (coverage_stalled && round_num > 10)) && break
     end
 
     # Free GPU resources if used

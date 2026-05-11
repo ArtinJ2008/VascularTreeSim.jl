@@ -24,6 +24,12 @@ output/*/
 # Legacy toggle file, superseded by embed_phantom_raw config flag
 output/.build_viewer.py.disabled
 
+# Per-state derived tree directories (e.g., output_at_rest/ from scale_to_rest.jl)
+output_*/
+
+# Per-run logs at repo root
+*.log
+
 # Test-generated artifacts
 test/output/
 

@@ -221,6 +221,12 @@ else
 end
 isempty(growth_trees) && error("No vessel trees initialized! Check config.")
 flush(stdout)
+# Note: root_diameter_override_cm is applied AFTER growth (not here), because
+# `_strict_murray_propagate!` runs during grow_trees_mcp! and directly
+# overwrites XCAT segment diameters via `d = terminal_d × N^(1/γ)`. Any
+# pre-growth scaling would be lost. Applying post-growth + pre-subdivide
+# means `_recompute_all_murray!` (which uses `max(existing, murray_d)` for
+# XCAT segments) preserves the override through subdivision.
 
 # ══════════════════════════════════════════════════════════════
 # Step 3: Competitive round-robin growth
@@ -250,6 +256,21 @@ end
 tree_weights_arg = isempty(tree_weights) ? nothing : tree_weights
 println("  tree_weights_arg = $(tree_weights_arg)"); flush(stdout)
 
+# Territory weights drive weighted-Voronoi territory assignment.  A tree with
+# a bigger root diameter (= larger anatomical supply capacity) claims points
+# up to (d_i / d_j) times farther away than a competitor, producing territory
+# volume ∝ d^3 — consistent with Murray's law (Q ∝ d^3).  If no tree has
+# `root_diameter_override_cm` set, fall back to uniform (pure-geometric)
+# territory assignment.
+territory_weights = Dict{String, Float64}()
+for spec in config.vessel_trees
+    if spec.root_diameter_override_cm > 0
+        territory_weights[spec.name] = spec.root_diameter_override_cm
+    end
+end
+territory_weights_arg = isempty(territory_weights) ? nothing : territory_weights
+println("  territory_weights_arg = $(territory_weights_arg)"); flush(stdout)
+
 graph, territories, stats = grow_trees_mcp!(growth_trees, domain;
     coverage_points_cm=coverage_points, graph_points_cm=graph_points,
     effective_supply_radius_cm=config.effective_supply_radius_cm,
@@ -267,10 +288,37 @@ graph, territories, stats = grow_trees_mcp!(growth_trees, domain;
     target_max_distance_cm=config.target_max_distance_cm,
     turn_penalty=config.turn_penalty,
     graph_jitter_cm=0.0,  # jitter already applied above
-    tree_weights=tree_weights_arg)
+    tree_weights=tree_weights_arg,
+    territory_weights=territory_weights_arg)
 
 for (name, st) in stats
     println("  $(name): $(st.added) grown + XCAT segments, $(st.terminals) terminals, p95=$(round(st.p95*10; digits=2))mm")
+end
+flush(stdout)
+
+# ── Apply root-diameter override to XCAT segments (post-growth, pre-subdivide)
+# When a tree spec sets `root_diameter_override_cm > 0`, every is_xcat segment
+# of that tree is scaled by `override / current_max_xcat` so the widest XCAT
+# segment reaches the clinical value while intra-tree tapering is preserved.
+# Grown (is_xcat=false) segments are left alone — their diameters are
+# Murray-derived from terminal_diameter_cm and should not be rescaled.
+# The subsequent `_recompute_all_murray!` (called inside subdivide_terminals!)
+# uses `max(existing_d, murray_d)` for XCAT segments, so the override persists
+# through subdivision as long as murray_d < override (which holds unless the
+# subtree is enormously larger than the XCAT root can accommodate).
+for spec in config.vessel_trees
+    override_d = spec.root_diameter_override_cm
+    (override_d > 0 && haskey(growth_trees, spec.name)) || continue
+    tree = growth_trees[spec.name]
+    xcat_idx = findall(tree.is_xcat)
+    isempty(xcat_idx) && continue
+    current_max = maximum(tree.segment_diameter_cm[i] for i in xcat_idx)
+    current_max <= 0 && continue
+    scale = override_d / current_max
+    for i in xcat_idx
+        tree.segment_diameter_cm[i] *= scale
+    end
+    println("  $(spec.name): $(length(xcat_idx)) XCAT segs scaled by $(round(scale; digits=3)) → max $(round(override_d*1e4; digits=1)) μm (was $(round(current_max*1e4; digits=1)) μm)")
 end
 flush(stdout)
 

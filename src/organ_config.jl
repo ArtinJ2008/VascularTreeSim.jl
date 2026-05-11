@@ -12,6 +12,7 @@ struct VesselTreeSpec
     color::String
     root_anchor_surface::String
     target_flow_ml_min::Float64  # anatomical prior used as per-tree growth weight (0 = unweighted uniform growth)
+    root_diameter_override_cm::Float64  # clinical literature root (ostium) diameter; when > 0, all XCAT segments in this tree are scaled so the max diameter hits this value (preserves intra-tree tapering). 0 = keep NRB-measured diameters verbatim.
 end
 
 struct OrganConfig
@@ -87,6 +88,7 @@ function load_organ_config(path::AbstractString)
             get(vt, "color", "#888888"),
             get(vt, "root_anchor_surface", ""),
             Float64(get(vt, "target_flow_ml_min", 0.0)),
+            Float64(get(vt, "root_diameter_override_cm", 0.0)),
         ))
     end
 

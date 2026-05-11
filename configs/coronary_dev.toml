@@ -43,21 +43,22 @@ name = "LAD"
 surface_names = ["dias_lad1", "dias_lad2", "dias_lad3"]
 color = "#1f77ff"
 root_anchor_surface = "dias_aorta"
-target_flow_ml_min = 242.0   # anatomical prior for per-round growth weight
+# target_flow_ml_min omitted → uniform 1:1:1 round-robin
+root_diameter_override_cm = 0.37
 
 [[vessel_trees]]
 name = "LCX"
 surface_names = ["dias_lcx"]
 color = "#e3342f"
 root_anchor_surface = "dias_aorta"
-target_flow_ml_min = 116.0
+root_diameter_override_cm = 0.34
 
 [[vessel_trees]]
 name = "RCA"
 surface_names = ["dias_rca1", "dias_rca2"]
 color = "#22aa44"
 root_anchor_surface = "dias_aorta"
-target_flow_ml_min = 214.0
+root_diameter_override_cm = 0.39
 
 [domain]
 voxel_spacing_cm = 0.05         # DEV: coarser (full: 0.02)
@@ -71,7 +72,7 @@ mode = "continue_from_xcat"
 effective_supply_radius_cm = 0.00125
 capillary_diameter_cm = 0.0008
 terminal_diameter_cm = 0.02            # 200 μm growth-phase terminal
-subdivision_terminal_diameter_cm = 0.0008   # 8 μm — SAME as full (v4 target)
+subdivision_terminal_diameter_cm = 0.0006   # 6 μm (SAME as full; off Pries minimum onto capillary viscosity rise)
 subdivision_clip_below_diameter_cm = 0.005  # SAME as full
 subdivision_max_ld_ratio = 25.0             # SAME as full
 max_new_branches_per_tree = 5000       # DEV: much smaller (full: 200000)

@@ -37,21 +37,24 @@ name = "LAD"
 surface_names = ["dias_lad1", "dias_lad2", "dias_lad3"]
 color = "#1f77ff"
 root_anchor_surface = "dias_aorta"
-target_flow_ml_min = 242.0   # anatomical prior for per-round growth weight (competitive territory allocation)
+# target_flow_ml_min omitted on purpose → 1:1:1 uniform round-robin growth.
+# Per-tree tree size / territory is shaped by the root_diameter_override_cm
+# anatomical prior below (Dodge 1992 angiographic mean adult).
+root_diameter_override_cm = 0.37   # LAD proximal 3.7 mm
 
 [[vessel_trees]]
 name = "LCX"
 surface_names = ["dias_lcx"]
 color = "#e3342f"
 root_anchor_surface = "dias_aorta"
-target_flow_ml_min = 116.0
+root_diameter_override_cm = 0.34   # LCX proximal 3.4 mm
 
 [[vessel_trees]]
 name = "RCA"
 surface_names = ["dias_rca1", "dias_rca2"]
 color = "#22aa44"
 root_anchor_surface = "dias_aorta"
-target_flow_ml_min = 214.0
+root_diameter_override_cm = 0.39   # RCA proximal 3.9 mm
 
 [domain]
 voxel_spacing_cm = 0.02         # Fine resolution (v5 fine run)
@@ -65,7 +68,7 @@ mode = "continue_from_xcat"     # Continue from existing XCAT LAD/LCX/RCA
 effective_supply_radius_cm = 0.00125   # 12.5 μm
 capillary_diameter_cm = 0.0008         # 8 μm  (legacy: kept for backwards compat)
 terminal_diameter_cm = 0.02            # 200 μm — Murray-strict terminal (leaf) diameter for growth phase
-subdivision_terminal_diameter_cm = 0.0008   # 8 μm — recursive bifurcation of terminals to capillary level
+subdivision_terminal_diameter_cm = 0.0006   # 6 μm (lower than 8 μm Pries F-L minimum, climbing onto capillary-viscosity-rise portion of Pries 1992 curve); was 0.0008
 subdivision_clip_below_diameter_cm = 0.005  # only clip sub-branches at arteriole scale (<50 μm); larger sub-branches allowed to extend outside myocardium (cf. real epicardial anatomy)
 subdivision_max_ld_ratio = 25.0             # post-subdivision safety net: split any residual L/d > 25 segment into shorter pieces at the same diameter
 max_new_branches_per_tree = 200000     # very large cap — real stop is Murray budget exhaustion / coverage

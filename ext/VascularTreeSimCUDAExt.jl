@@ -39,7 +39,12 @@ Each thread = one point, iterates over ALL n_segs segments.
 function _kernel_min_seg_dist!(min_dist, owner,
                                 px, py, pz,
                                 ax, ay, az, bx, by, bz,
-                                n_segs::Int32, tree_idx::Int32)
+                                n_segs::Int32, tree_idx::Int32, inv_weight::Float64)
+    # min_dist stores EFFECTIVE distance = raw * (1/weight_owner); see
+    # growth_engine.jl comment. `inv_weight` here is 1/weight of the tree being
+    # added. A larger weight (smaller inv_weight) shrinks the effective
+    # distance, letting the tree claim points up to `weight` times farther
+    # (in raw distance) than a unit-weight competitor.
     i = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x
     i > length(px) && return nothing
 
@@ -69,9 +74,9 @@ function _kernel_min_seg_dist!(min_dist, owner,
         d2 < best_d2 && (best_d2 = d2)
     end
 
-    d = sqrt(best_d2)
-    @inbounds if d < min_dist[i]
-        min_dist[i] = d
+    d_eff = sqrt(best_d2) * inv_weight
+    @inbounds if d_eff < min_dist[i]
+        min_dist[i] = d_eff
         owner[i] = tree_idx
     end
     return nothing
@@ -83,7 +88,8 @@ Incremental kernel — only processes segments in range [seg_start, seg_end].
 function _kernel_min_seg_dist_range!(min_dist, owner,
                                       px, py, pz,
                                       ax, ay, az, bx, by, bz,
-                                      seg_start::Int32, seg_end::Int32, tree_idx::Int32)
+                                      seg_start::Int32, seg_end::Int32, tree_idx::Int32,
+                                      inv_weight::Float64)
     i = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x
     i > length(px) && return nothing
 
@@ -111,9 +117,9 @@ function _kernel_min_seg_dist_range!(min_dist, owner,
             d2 = dx * dx + dy * dy + dz * dz
         end
 
-        d = sqrt(d2)
-        if d < best_d
-            best_d = d
+        d_eff = sqrt(d2) * inv_weight
+        if d_eff < best_d
+            best_d = d_eff
             best_owner = tree_idx
         end
     end
@@ -129,7 +135,7 @@ Seed tree kernel — distance from all points to a single root vertex.
 function _kernel_seed_dist!(min_dist, owner,
                              px, py, pz,
                              rx::Float64, ry::Float64, rz::Float64,
-                             tree_idx::Int32)
+                             tree_idx::Int32, inv_weight::Float64)
     i = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x
     i > length(px) && return nothing
 
@@ -137,9 +143,9 @@ function _kernel_seed_dist!(min_dist, owner,
         dx = px[i] - rx
         dy = py[i] - ry
         dz = pz[i] - rz
-        d = sqrt(dx * dx + dy * dy + dz * dz)
-        if d < min_dist[i]
-            min_dist[i] = d
+        d_eff = sqrt(dx * dx + dy * dy + dz * dz) * inv_weight
+        if d_eff < min_dist[i]
+            min_dist[i] = d_eff
             owner[i] = tree_idx
         end
     end
@@ -172,7 +178,8 @@ end
 
 function VascularTreeSim._gpu_full_distance_scan!(state::GPUDistanceState,
                                                     seg_idx::VascularTreeSim.SegmentSpatialIndex,
-                                                    tree_idx::Int)
+                                                    tree_idx::Int;
+                                                    weight::Float64=1.0)
     nseg = length(seg_idx.ax)
     nseg == 0 && return nothing
 
@@ -188,7 +195,7 @@ function VascularTreeSim._gpu_full_distance_scan!(state::GPUDistanceState,
         state.d_min_dist, state.d_owner,
         state.d_px, state.d_py, state.d_pz,
         d_ax, d_ay, d_az, d_bx, d_by, d_bz,
-        Int32(nseg), Int32(tree_idx))
+        Int32(nseg), Int32(tree_idx), 1.0 / weight)
     CUDA.synchronize()
 
     CUDA.unsafe_free!(d_ax); CUDA.unsafe_free!(d_ay); CUDA.unsafe_free!(d_az)
@@ -198,13 +205,14 @@ end
 
 function VascularTreeSim._gpu_seed_distance!(state::GPUDistanceState,
                                                root_vertex::SVector{3,Float64},
-                                               tree_idx::Int)
+                                               tree_idx::Int;
+                                               weight::Float64=1.0)
     threads, blocks = _launch_config(state.n_points)
     @cuda threads=threads blocks=blocks _kernel_seed_dist!(
         state.d_min_dist, state.d_owner,
         state.d_px, state.d_py, state.d_pz,
         root_vertex[1], root_vertex[2], root_vertex[3],
-        Int32(tree_idx))
+        Int32(tree_idx), 1.0 / weight)
     CUDA.synchronize()
     return nothing
 end
@@ -212,7 +220,8 @@ end
 function VascularTreeSim._gpu_incremental_scan!(state::GPUDistanceState,
                                                   seg_idx::VascularTreeSim.SegmentSpatialIndex,
                                                   tree_idx::Int,
-                                                  seg_start::Int, seg_end::Int)
+                                                  seg_start::Int, seg_end::Int;
+                                                  weight::Float64=1.0)
     seg_end < seg_start && return nothing
     nseg_total = length(seg_idx.ax)
     nseg_total == 0 && return nothing
@@ -231,7 +240,7 @@ function VascularTreeSim._gpu_incremental_scan!(state::GPUDistanceState,
         state.d_min_dist, state.d_owner,
         state.d_px, state.d_py, state.d_pz,
         d_ax, d_ay, d_az, d_bx, d_by, d_bz,
-        Int32(seg_start), Int32(seg_end), Int32(tree_idx))
+        Int32(seg_start), Int32(seg_end), Int32(tree_idx), 1.0 / weight)
     CUDA.synchronize()
 
     CUDA.unsafe_free!(d_ax); CUDA.unsafe_free!(d_ay); CUDA.unsafe_free!(d_az)
