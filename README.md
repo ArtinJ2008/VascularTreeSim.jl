@@ -1,578 +1,314 @@
 # VascularTreeSim.jl
 
-A Julia package for vascular tree generation using competitive constrained
-constructive optimization (CCO) within anatomical domains.
+Vascular tree generation by competitive constrained-constructive optimization
+(CCO) in anatomical voxel domains. Input is either an XCAT NURBS phantom file
+(`.nrb`) or a synthetic geometry; output is a per-tree segment CSV and an
+interactive 3-D HTML viewer.
 
-Given an XCAT NURBS phantom file (`.nrb`) or a synthetic geometry, this package
-builds a 3-D voxel domain of the organ wall, initializes vessel trees from either
-XCAT centerlines or user-supplied seed points, and grows new branches via
-competitive round-robin minimum-cost-path (MCP) routing until the tissue is
-adequately perfused. Outputs include per-tree CSV segment files and an interactive
-3-D HTML viewer.
+The package is **organ-agnostic** — every organ-specific value (surface names,
+root anchors, root diameters, target flows) lives in a `.toml` config. No
+LAD/LCX/RCA strings are hardcoded in the source; the same code grows brain or
+skeletal-muscle trees by editing the config alone.
 
-## Features
+---
 
-- **TOML-driven configuration** -- all organ names, surfaces, vessel definitions, and
-  growth parameters live in a single `.toml` file. No organ-specific logic is
-  hardcoded.
-- **Two growth modes**: `continue_from_xcat` (extend existing XCAT centerlines) and
-  `seed_point` (grow from scratch at user-specified coordinates).
-- **Competitive round-robin territory** -- multiple trees (e.g. LAD, LCX, RCA) grow
-  simultaneously, each claiming the tissue closest to its existing branches.
-- **Anatomically-weighted per-round growth** -- each tree's per-round frontier batch
-  scales with a `target_flow_ml_min` prior declared under `[[vessel_trees]]`. A
-  tree with a higher target flow (e.g. LAD at 242 mL/min) grows faster per round
-  than a smaller-territory tree (e.g. LCX at 116 mL/min), producing sub-terminal
-  counts that match anatomical flow-demand ratios. Omit the field for unweighted
-  (uniform) growth, matching the prior behavior.
-- **Max-anatomy Murray diameters** -- grown segments are sized strictly by
-  `d = d_term × N^(1/γ)`; XCAT-derived segments keep `max(NRB-measured, Murray)` so
-  the measured ostium/proximal diameters are preserved even when Murray alone
-  would predict a thinner vessel. This avoids collapsing the XCAT root when the
-  subtree is small.
-- **Hybrid growth + subdivision pipeline** -- grow first to a realistic 200 μm
-  terminal, then recursively bifurcate each tip to 8 μm capillaries. This produces
-  physiological root diameters (mm-scale) and true capillary counts (tens of
-  millions) in a single pipeline.
-- **Domain-clipped subdivision with rotation retry** -- bifurcation children are
-  tested against the voxel mask; up to 8 random plane rotations are tried per
-  split so the tree stays inside the anatomical shell without losing whole
-  subtrees to a single unlucky random direction.
-- **Chamber vs. tubular cavity auto-detection** -- tubular surfaces whose centroid
-  falls outside the organ wall (e.g. aorta, SVC, IVC in a cardiac phantom) are
-  automatically detected and given a bounded SDF subtraction + fallback flood-fill
-  seed, preventing over-subtraction far from the actual surface samples.
-- **Catmull-Rom spline smoothing** with domain-constrained Laplacian passes produces
-  anatomically plausible branch geometry.
-- **Heap-based Dijkstra routing** on a k-nearest-neighbor voxel graph ensures paths
-  stay within the myocardial shell.
-- **Coverage-driven + stall-aware stopping** -- growth halts when P95/max distance
-  targets are met, when the branch budget is exhausted, or when P95 stops
-  improving for 20 consecutive rounds.
-- **Interactive HTML viewer** (Plotly-based) with diameter-binned line widths and
-  per-tree color coding.
+## Pipeline
+
+```
+NRB phantom + config.toml
+        │
+        ▼
+┌─────────────────────────────┐
+│ 1. Parse NRB → flood-fill   │
+│    voxel-shell organ domain │
+└─────────────────────────────┘
+        │
+        ▼
+┌─────────────────────────────┐
+│ 2. Init trees from XCAT     │
+│    centerlines (or seeds)   │
+└─────────────────────────────┘
+        │
+        ▼
+┌─────────────────────────────┐
+│ 3. Competitive round-robin  │
+│    growth with weighted-    │
+│    Voronoi territory + per- │
+│    tree p95 stall detection │
+└─────────────────────────────┘
+        │
+        ▼
+┌─────────────────────────────┐
+│ 4. Recursive bifurcation    │
+│    of every 200 μm tip down │
+│    to 6 μm capillaries      │
+└─────────────────────────────┘
+        │
+        ▼
+  <tree>_segments.csv  + viewer.html
+        │
+        ▼  (optional, post-growth)
+┌─────────────────────────────┐
+│ 5. scale_to_rest.jl: apply  │
+│    diameter-dependent       │
+│    arteriolar tone to get   │
+│    the at-rest geometry     │
+└─────────────────────────────┘
+        │
+        ▼
+  <tree>_segments.csv (at-rest)
+```
+
+The downstream flow simulator
+([FlowContrastSim.jl](../FlowContrastSim.jl)) consumes the CSVs directly.
+
+---
+
+## Key concepts
+
+**Murray's law on every segment.** Both grown (round-robin) and subdivided
+(recursive bifurcation) segments take their diameter from
+`d = d_term · N^(1/γ)` where `N` is the count of capillary terminals in the
+subtree below and γ = 3. XCAT-derived ostia keep `max(NRB-measured, Murray)`
+so a clinically realistic root (e.g. 3.7 mm for LAD) survives even when the
+subtree is small.
+
+**Weighted-Voronoi territory.** Each tree claims tissue up to
+`(d_i / d_j) ×` farther than a competitor with smaller root diameter,
+producing territory volume ∝ d³ (consistent with Q ∝ d³). Without weights
+all trees share territory by pure geometric proximity.
+
+**Per-tree p95 saturation stop.** Growth halts independently per tree when
+its own owned-points p95 distance stalls — a fast-territory tree won't keep
+stretching into already-covered tissue while a slow-territory tree is still
+genuinely improving.
+
+**Domain-clipped subdivision.** When recursive bifurcation would put a
+sub-arteriole tip outside the myocardial shell, up to 8 random plane rotations
+are tried so the tree stays inside the organ. Clipping only applies below
+`subdivision_clip_below_diameter_cm` (default 50 μm) because large epicardial
+vessels naturally sit on or outside the wall.
+
+**L/d safety net.** After Murray re-recompute, any residual segment with
+length / diameter > `subdivision_max_ld_ratio` (default 25) is split into
+equal-length pieces at the same diameter. Preserves Murray (d unchanged) and
+keeps Poiseuille resistance physically reasonable.
+
+**At-rest tree (`scripts/scale_to_rest.jl`).** Murray-optimal diameters
+correspond to maximum vasodilation. To produce the at-rest state, scale
+arteriolar diameters via a bell curve in log10(D) centered at 100 μm —
+conduit vessels (> 1 mm) and capillaries (< 10 μm) are nearly unchanged;
+peak arterioles (~100 μm) shrink by `tone_max` (default 0.4, recommended 0.55
+for clinical coronary CFR). The flow simulator then treats the two CSV sets
+as the same anatomy in two different smooth-muscle states.
+
+---
 
 ## Installation
 
-The package uses only Julia standard libraries plus `StaticArrays`. Requires Julia >= 1.9.
+Requires Julia ≥ 1.9. Not registered in General; develop from a local clone:
 
 ```julia
 using Pkg
-
-# Install from a local clone:
 Pkg.develop(path="/path/to/VascularTreeSim.jl")
-
-# Or from a Git URL:
-Pkg.add(url="https://github.com/your-org/VascularTreeSim.jl.git")
+Pkg.instantiate()
 ```
 
-## Quick Start
+GPU acceleration is via a `CUDA` weak dependency: `using CUDA, VascularTreeSim`
+loads the GPU kernels; pure-CPU runs need only the base package.
 
-### From TOML config (XCAT phantom workflow)
+---
+
+## Quick start — coronary tree from XCAT
+
+```bash
+julia --project=. --threads=auto examples/run_coronary_growth.jl \
+      configs/coronary.toml
+```
+
+For the vmale50 phantom this produces, in `output/`:
+- `lad_segments.csv` (~28 GB, ~121 M segments, root 3.7 mm → 6 μm capillaries)
+- `lcx_segments.csv` (~25 GB, ~110 M segments, root 3.4 mm → 6 μm)
+- `rca_segments.csv` (~29 GB, ~127 M segments, root 3.9 mm → 6 μm)
+- `xcat_coronary_viewer.html`
+- ancillary point clouds (`domain_points.csv`, `chambers_points.csv`, …)
+
+Full run on a 256 GB / RTX 4090 workstation: **~6 hours** dominated by the
+6 μm subdivision pass.
+
+To produce the at-rest tree (used by FlowContrastSim's baseline config):
+
+```bash
+for tree in lad lcx rca; do
+  julia --project=. scripts/scale_to_rest.jl \
+        output/${tree}_segments.csv \
+        output_at_rest/${tree}_segments.csv \
+        0.55   # tone_max — peak arteriole D × 0.45
+done
+```
+
+Each tree takes ~2.5 min (IO-bound, ~840 k rows/s).
+
+---
+
+## Synthetic / non-XCAT use
+
+For a new organ without an XCAT phantom, use the seed-point mode:
 
 ```julia
-using VascularTreeSim
-
-config = load_organ_config("configs/coronary.toml")
-result = run_growth(config; output_dir="output")
-# result.html_path → interactive 3-D viewer
+using VascularTreeSim, StaticArrays
+tree = growth_tree_from_seed("Brain_MCA", SVector(5.0, 5.0, 5.0))
+# … build a VoxelShellDomain manually …
+graph, _, stats = grow_trees_mcp!(Dict("Brain_MCA" => tree), domain; …)
 ```
 
-### From seed point (synthetic geometry)
+`examples/synthetic_cube.jl` is a runnable demo on a cube-shell domain.
+`examples/check_domain_only.jl` builds and visualizes the domain alone — useful
+for sanity-checking `[surfaces]`/`[domain]` config changes without paying the
+~6 h growth cost.
 
-```julia
-using VascularTreeSim
-using StaticArrays
+---
 
-tree = growth_tree_from_seed("MyTree", SVector(3.0, 0.5, 3.0))
-trees = Dict("MyTree" => tree)
+## OrganConfig TOML schema
 
-# Build domain, graph, then grow (see examples/synthetic_cube.jl)
-graph, territories, stats = grow_trees_mcp!(trees, domain; max_new_branches_per_tree=300)
+```toml
+[organ]
+name = "coronary"
+nrb_path = "/path/to/vmale50_heart.nrb"
+phantom_path = "/path/to/vmale50_1600x1400x500_8bit_little_endian_act_1.raw"
+phantom_dims = [1600, 1400, 500]
+coordinate_scale = 0.1     # NRB mm → cm
+embed_phantom_raw = false  # set true to also write a .raw with grown trees
+                           # embedded — costs +5 min and +1 GB
 
-# Export
-write_growth_csv("segments.csv", "MyTree", trees["MyTree"])
+[surfaces]
+outer = "dias_pericardium"
+reference = "dias_aorta"
+cavities = [ "dias_lv_0", "dias_lv_1", … ]    # chambers + tubular cavities
+                                              # (subtracted from organ shell)
+
+[[vessel_trees]]
+name = "LAD"
+surface_names = ["dias_lad1", "dias_lad2", "dias_lad3"]
+root_anchor_surface = "dias_aorta"
+root_diameter_override_cm = 0.37    # Dodge 1992 anatomical prior, applied
+                                    # AFTER growth and BEFORE subdivide
+# target_flow_ml_min = 242          # optional; weights per-round batch size
+# color = "#1f77ff"
+
+[[vessel_trees]]
+name = "LCX"
+…
+
+[domain]
+voxel_spacing_cm = 0.02           # fine resolution (v5)
+outer_samples = [96, 72]          # u/v NURBS sample grid for outer surface
+cavity_samples = [56, 40]
+dilation_radius = 1               # voxels
+coarse_seed_cm = [14.085, 21.628, 26.966]   # midwall seed for flood-fill
+
+[growth]
+mode = "continue_from_xcat"       # or "seed_point"
+effective_supply_radius_cm = 0.00125     # 12.5 μm — frontier suppression radius
+terminal_diameter_cm = 0.02              # 200 μm — Murray-strict terminal during growth
+subdivision_terminal_diameter_cm = 0.0006  # 6 μm — capillary target after subdivision
+subdivision_clip_below_diameter_cm = 0.005 # 50 μm — only clip thin sub-branches
+subdivision_max_ld_ratio = 25.0
+max_new_branches_per_tree = 200000        # cap; real stop is Murray budget / p95 stall
+graph_neighbors = 16
+min_frontier_separation_cm = 0.015
+max_path_nodes = 20
+frontier_batch = 28                        # per-round frontier targets per tree
+murray_gamma = 3.0
+max_segment_length_cm = 0.1
+smooth_passes = 20                         # Laplacian smoothing of paths
+spline_density = 5
+coverage_stride = 4                        # block size for coverage points
+graph_stride = 12                          # block size for graph points
+graph_jitter_cm = 0.08                     # break grid alignment
+turn_penalty = 0.5                         # Dijkstra cost of changing direction
+target_p95_distance_cm = 0.005             # stop when this is met
+target_max_distance_cm = 0.01
 ```
+
+`[seed_points]` is only consulted when `growth.mode = "seed_point"`.
+
+---
+
+## CSV output format
+
+Each segment is one row:
+
+| column | unit | meaning |
+|---|---|---|
+| `branch` | — | tree name (e.g. LAD) |
+| `segment_id` | int | unique within tree |
+| `parent_segment_id` | int | id of the segment ending at this segment's start vertex (0 for root) — **the authoritative topology source** |
+| `x1_cm, y1_cm, z1_cm` | cm | start coords |
+| `x2_cm, y2_cm, z2_cm` | cm | end coords |
+| `xmid_cm, ymid_cm, zmid_cm` | cm | midpoint (convenience) |
+| `length_mm` | mm | Euclidean length |
+| `diameter_um` | μm | Murray + (XCAT max-rule for is_xcat segments) |
+| `label` | — | `dias_lad1` etc. for XCAT, `grown` for round-robin, `subdivided` for recursive-bifurcation |
+
+A downstream consumer should rebuild the tree from `parent_segment_id`, **not**
+from coordinate coincidence. Dense subdivided trees pack vertices tightly
+enough (~100 M end-points in 60 g of myocardium) that 10 nm coordinate
+rounding can collapse unrelated endpoints; FlowContrastSim handles this by
+following the parent-id chain.
+
+---
 
 ## Testing
 
-```julia
-using Pkg
-Pkg.test("VascularTreeSim")
+```bash
+julia --project=. -e "using Pkg; Pkg.test()"
 ```
 
-Runs 3 synthetic geometry tests (cube shell, sphere shell, cylinder) with
-`@testset` assertions on branch count, terminal count, and coverage metrics.
+`test/` exercises the cube-shell, sphere-shell, and cylinder seed-point
+workflows on synthetic domains. The XCAT-coronary pipeline is too expensive
+to run in unit tests.
 
-The `output/` directory will contain:
+`examples/benchmark_gpu.jl` reports CPU vs GPU growth wall-time on a cube
+shell.
 
-- `lad_grown_segments.csv`, `lcx_grown_segments.csv`, `rca_grown_segments.csv`
-- `index.html` -- interactive 3-D viewer
+---
 
-## Architecture Overview
+## API quick reference
 
-The pipeline executed by `run_growth` proceeds through these stages:
-
-```
-NRB file
-  |  parse_xcat_nrb()
-  v
-NURBS surfaces (Dict{String, XCATNurbsSurface})
-  |  xcat_centerline_from_surface()  +  build_vessel_trees()
-  v
-Centerline trees (Dict{String, XCATCenterlineTree})
-  |  growth_tree_from_xcat() / growth_tree_from_seed()
-  v
-GrowthTree structs (mutable, per-vessel)
-  |
-  |  build_voxel_shell_domain_floodfill()  -- chamber/tube auto-detection
-  v
-VoxelShellDomain (3-D BitArray mask of organ wall)
-  |  build_domain_graph()  -- k-NN graph over voxel points
-  v
-DomainGraph (nodes + weighted edges)
-  |  grow_trees_mcp!()  -- competitive round-robin MCP growth
-  v                         (strict Murray: d = d_term × N^(1/γ) everywhere)
-Grown GrowthTree structs
-  |
-  |  subdivide_terminals!()  -- optional: recursive bifurcation to finer
-  v                             terminal diameter, domain-clipped with
-  v                             rotation retry
-Subdivided GrowthTree structs
-  |  write_growth_csv()  +  growth_viewer_html()
-  v
-CSV files  +  HTML viewer
-```
-
-### Key data structures
-
-| Struct | Purpose |
+| function | purpose |
 |---|---|
-| `OrganConfig` | All parameters from the TOML file |
-| `VesselTreeSpec` | Per-tree name, surface names, color, anchor |
-| `XCATNurbsSurface` | Parsed NURBS control points and knot vectors |
-| `XCATCenterline` | Centerline points + radii extracted from a NURBS surface |
-| `XCATCenterlineTree` | Connected tree of `XCATCenterline` segments |
-| `VoxelShellDomain` | 3-D voxel mask + surface point clouds for distance queries |
-| `DomainGraph` | k-NN graph with midwall-cost-weighted edges |
-| `GrowthTree` | Mutable vertex/segment tree with diameters and labels |
+| `load_organ_config(path)` | parse TOML → `OrganConfig` |
+| `parse_xcat_nrb(path)` | parse `.nrb` → `Vector{XCATNurbsSurface}` |
+| `xcat_centerline_from_surface(surf)` | NURBS surface → centerline tree |
+| `build_vessel_trees(centerlines, config)` | wire centerlines into trees per config |
+| `build_voxel_shell_domain_floodfill(outer, cavities; …)` | NRB surfaces → `VoxelShellDomain` |
+| `growth_tree_from_xcat(name, xcat_tree; terminal_diameter_cm)` | XCAT centerline → `GrowthTree` |
+| `growth_tree_from_seed(name, point; terminal_diameter_cm)` | seed point → empty `GrowthTree` |
+| `grow_trees_mcp!(trees, domain; …)` | competitive round-robin growth |
+| `subdivide_terminals!(tree; target_diameter_cm, …)` | recursive bifurcation to capillaries |
+| `write_growth_csv(path, branch, tree)` | export to CSV |
+| `growth_viewer_html(path, domain, trees, stats, color_map; …)` | interactive 3-D viewer |
+| `run_growth(config; output_dir)` | end-to-end pipeline (used by `examples/run_coronary_growth.jl`) |
 
-## OrganConfig TOML Schema
+See `src/VascularTreeSim.jl` for the full export list.
 
-### `[organ]`
+---
 
-| Field | Type | Description |
-|---|---|---|
-| `name` | `String` | Organ identifier (e.g. `"coronary"`) |
-| `nrb_path` | `String` | Absolute path to the XCAT `.nrb` file |
-| `phantom_path` | `String` | Absolute path to the `.raw` XCAT phantom volume (optional — only read if `embed_phantom_raw = true`) |
-| `phantom_dims` | `[Int, Int, Int]` | `(nx, ny, nz)` voxel dimensions of the raw phantom |
-| `coordinate_scale` | `Float64` | Multiplier converting NRB coordinates to cm (default `0.1` for mm-to-cm) |
-| `embed_phantom_raw` | `Bool` | If `true`, Step 5 embeds the grown trees into the XCAT raw volume and writes `vmale50_with_grown_coronaries.raw` (~1 GB). Default `true` for backward compatibility; set `false` when you only need the CSV output. |
+## Reproducing the canonical vmale50 coronary run
 
-### `[surfaces]`
+1. `julia --project=. --threads=auto examples/run_coronary_growth.jl configs/coronary.toml` (~6 h)
+2. Three trees in `output/{lad,lcx,rca}_segments.csv`. Topology is deterministic given the same config + NRB; subdivision uses a name-keyed RNG so the recursive bifurcation orientations are also stable.
+3. (Optional) `julia scripts/scale_to_rest.jl …` for each tree to produce `output_at_rest/`.
+4. Hand the two CSV directories to `FlowContrastSim.jl/scripts/natural_flow_summary.jl` with `configs/coronary_baseline.toml` and `configs/coronary_hyperemic.toml`.
 
-| Field | Type | Description |
-|---|---|---|
-| `outer` | `String` | Name of the outer bounding surface (e.g. `"dias_pericardium"`) |
-| `cavities` | `Array{String}` | Names of cavity surfaces to exclude (LV, RV, LA, RA, etc.) |
-| `reference` | `String` | Reference surface for root orientation (e.g. `"dias_aorta"`) |
+Expected flow numbers (cap_R = 0.15 mmHg·min/mL/100 g, tone_max = 0.55):
 
-### `[[vessel_trees]]` (array of tables)
-
-| Field | Type | Description |
-|---|---|---|
-| `name` | `String` | Tree identifier (e.g. `"LAD"`, `"LCX"`, `"RCA"`) |
-| `surface_names` | `Array{String}` | XCAT surface names belonging to this tree |
-| `color` | `String` | Hex color for the viewer (default `"#888888"`) |
-| `root_anchor_surface` | `String` | Surface used to anchor the tree root (e.g. `"dias_aorta"`) |
-| `target_flow_ml_min` | `Float64` | Optional anatomical prior used as a per-round growth weight. When any tree sets this, the per-round frontier batch for tree `i` is scaled by `target_i / (Σ target) × n_trees` so that sub-terminal counts match anatomical flow-demand ratios. Default `0.0` (unweighted). |
-
-### `[domain]`
-
-| Field | Type | Default | Description |
+| tree | baseline (mL/min) | hyperemic (mL/min) | CFR |
 |---|---|---|---|
-| `voxel_spacing_cm` | `Float64` | `0.05` | Isotropic voxel edge length in cm |
-| `outer_samples` | `[Int, Int]` | `[96, 72]` | `(n_u, n_v)` samples on the outer surface |
-| `cavity_samples` | `[Int, Int]` | `[56, 40]` | `(n_u, n_v)` samples per cavity surface |
-| `dilation_radius` | `Int` | `1` | Voxel dilation passes for the shell mask |
-| `coarse_seed_cm` | `[Float64, Float64, Float64]` | `nothing` | Optional 3-D seed for flood fill; omit to auto-detect |
-
-### `[growth]`
-
-| Field | Type | Default | Description |
-|---|---|---|---|
-| `mode` | `String` | `"continue_from_xcat"` | Growth mode: `"continue_from_xcat"` or `"seed_point"` |
-| `effective_supply_radius_cm` | `Float64` | `0.00125` | Radius within which a point is considered perfused |
-| `capillary_diameter_cm` | `Float64` | `0.0008` | Terminal (capillary) diameter cutoff (legacy; use `terminal_diameter_cm`) |
-| `terminal_diameter_cm` | `Float64` | `capillary_diameter_cm` | Murray-strict terminal (leaf) diameter for the growth phase. Root diameter scales as `d_term × N_terminals^(1/γ)`. |
-| `subdivision_terminal_diameter_cm` | `Float64` | `0.0` | If > 0 and < `terminal_diameter_cm`, run post-growth recursive bifurcation on every terminal until segment diameter reaches this value. `0` disables subdivision. |
-| `subdivision_max_ld_ratio` | `Float64` | `25.0` | Post-Murray re-length pass: any segment whose `L/d` exceeds this threshold is split axially into shorter pieces at the same diameter, preserving Murray while eliminating long-thin bottlenecks created when downstream domain clipping shrinks the effective terminal count. Set to `0` to skip. |
-| `subdivision_clip_below_diameter_cm` | `Float64` | `0.0` | Only domain-clip sub-branches whose child diameter is below this threshold. Larger sub-branches are allowed to extend outside the myocardial shell (matching real epicardial-vessel anatomy). `0` disables the exemption (all sub-branches are clipped). |
-| `max_new_branches_per_tree` | `Int` | `220` | Maximum branches to add per tree |
-| `graph_neighbors` | `Int` | `12` | k for the k-nearest-neighbor domain graph |
-| `min_frontier_separation_cm` | `Float64` | `0.18` | Minimum spacing between frontier targets in a batch |
-| `max_path_nodes` | `Int` | `20` | Maximum waypoints per branch path |
-| `frontier_batch` | `Int` | `8` | Number of frontier targets per tree per round |
-| `murray_gamma` | `Float64` | `3.0` | Exponent for Murray's law diameter propagation |
-| `max_segment_length_cm` | `Float64` | `0.1` | Maximum length of a single segment; longer segments are densified |
-| `smooth_passes` | `Int` | `20` | Laplacian smoothing iterations on branch paths |
-| `spline_density` | `Int` | `5` | Catmull-Rom interpolation points per span |
-| `coverage_stride` | `Int` | `2` | Block-stride for coverage target point sampling |
-| `graph_stride` | `Int` | `0` | Block-stride for graph routing points (0 = same as `coverage_stride`) |
-| `graph_jitter_cm` | `Float64` | `0.0` | Random jitter applied to graph points (0 = disabled) |
-| `target_p95_distance_cm` | `Float64` | `Inf` | Stop growing when P95 distance drops below this |
-| `target_max_distance_cm` | `Float64` | `Inf` | Stop growing when max distance drops below this |
-
-### `[seed_points]` (only for `mode = "seed_point"`)
-
-Key-value pairs where each key is a tree name and each value is a `[x, y, z]` array
-in cm:
-
-```toml
-[seed_points]
-LAD = [2.5, -1.0, 3.0]
-LCX = [2.6, -0.8, 2.9]
-```
-
-## Growth Modes
-
-### `continue_from_xcat`
-
-Extracts centerlines from XCAT NURBS vessel surfaces, assembles them into
-`XCATCenterlineTree` structures, and converts those into `GrowthTree` objects.
-New branches are grown outward from the tips and along the existing tree.
-
-```toml
-[growth]
-mode = "continue_from_xcat"
-```
-
-This is the default mode. It requires that the `surface_names` listed in each
-`[[vessel_trees]]` entry match surfaces present in the NRB file.
-
-### `seed_point`
-
-Creates a minimal single-vertex `GrowthTree` at each specified seed coordinate.
-All branches are grown from scratch. Useful when XCAT vessel surfaces are
-unavailable or when modeling non-coronary organs.
-
-```toml
-[growth]
-mode = "seed_point"
-
-[seed_points]
-Tree1 = [2.5, -1.0, 3.0]
-Tree2 = [2.6, -0.8, 2.9]
-```
-
-Each key under `[seed_points]` must match a `name` in one of the `[[vessel_trees]]`
-entries.
-
-## Extending to New Organs
-
-To add support for a new organ (e.g. liver, kidney):
-
-1. **Obtain an XCAT NRB file** containing the organ's outer surface, cavity
-   surfaces, and (optionally) vessel surfaces.
-
-2. **Identify surface names** by parsing the NRB:
-   ```julia
-   surfaces = parse_xcat_nrb("/path/to/organ.nrb")
-   for s in surfaces
-       println(s.name)
-   end
-   ```
-
-3. **Create a new TOML config** (e.g. `configs/liver.toml`):
-   ```toml
-   [organ]
-   name = "liver"
-   nrb_path = "/path/to/organ.nrb"
-   coordinate_scale = 0.1
-
-   [surfaces]
-   outer = "liver_capsule"
-   cavities = []
-   reference = ""
-
-   [[vessel_trees]]
-   name = "HepaticArtery"
-   surface_names = []
-   color = "#ff4444"
-
-   [domain]
-   voxel_spacing_cm = 0.05
-
-   [growth]
-   mode = "seed_point"
-
-   [seed_points]
-   HepaticArtery = [5.0, 2.0, 1.0]
-   ```
-
-4. **Tune domain parameters** -- adjust `voxel_spacing_cm`, `outer_samples`, and
-   `cavity_samples` for the organ's size and complexity.
-
-5. **Tune growth parameters** -- start with defaults and iterate on
-   `max_new_branches_per_tree`, `min_frontier_separation_cm`, and
-   `effective_supply_radius_cm` to achieve desired density.
-
-6. **Run**:
-   ```julia
-   config = load_organ_config("configs/liver.toml")
-   run_growth(config; output_dir="output_liver")
-   ```
-
-## Output Format
-
-Each tree produces a CSV file (e.g. `lad_grown_segments.csv`) with the following
-columns:
-
-| Column | Type | Unit | Description |
-|---|---|---|---|
-| `branch` | `String` | -- | Tree name (e.g. `"LAD"`) |
-| `segment_id` | `Int` | -- | 1-based segment index |
-| `parent_segment_id` | `Int` | -- | ID of the parent segment (0 for the root segment) |
-| `x1_cm` | `Float64` | cm | Start-point x coordinate |
-| `y1_cm` | `Float64` | cm | Start-point y coordinate |
-| `z1_cm` | `Float64` | cm | Start-point z coordinate |
-| `x2_cm` | `Float64` | cm | End-point x coordinate |
-| `y2_cm` | `Float64` | cm | End-point y coordinate |
-| `z2_cm` | `Float64` | cm | End-point z coordinate |
-| `xmid_cm` | `Float64` | cm | Midpoint x coordinate |
-| `ymid_cm` | `Float64` | cm | Midpoint y coordinate |
-| `zmid_cm` | `Float64` | cm | Midpoint z coordinate |
-| `length_mm` | `Float64` | mm | Segment length |
-| `diameter_um` | `Float64` | um | Segment diameter |
-| `label` | `String` | -- | `"grown"` for new branches; original XCAT surface name otherwise |
-
-The `parent_segment_id` column enables deterministic reconstruction of the full tree
-topology from the flat CSV.
-
-## API Reference
-
-### Configuration
-
-```julia
-load_organ_config(path::AbstractString) -> OrganConfig
-```
-Parse a TOML file and return a fully populated `OrganConfig`.
-
-### NRB Parsing
-
-```julia
-parse_xcat_nrb(path::AbstractString) -> Vector{XCATNurbsSurface}
-```
-Read an XCAT `.nrb` file and return all NURBS surfaces.
-
-```julia
-xcat_object_dict(surfaces) -> Dict{String, XCATNurbsSurface}
-```
-Index surfaces by name for convenient lookup.
-
-```julia
-xcat_sample_surface(surface; n_u, n_v, orient_outward) -> (points, normals, ...)
-```
-Evaluate a NURBS surface on a regular `(n_u, n_v)` parameter grid.
-
-### Centerline Extraction
-
-```julia
-xcat_centerline_from_surface(surface::XCATNurbsSurface) -> XCATCenterline
-```
-Extract a centerline (center points + radii) from a tubular NURBS surface.
-
-```julia
-build_vessel_trees(centerlines, config::OrganConfig) -> Dict{String, XCATCenterlineTree}
-```
-Assemble centerlines into connected tree structures based on config vessel specs.
-
-### Domain Construction
-
-```julia
-build_voxel_shell_domain_floodfill(outer, cavities; ...) -> VoxelShellDomain
-```
-Build a 3-D voxel mask of the organ wall via flood fill between outer and cavity
-surfaces.
-
-```julia
-coverage_target_points(domain; stride) -> Matrix{Float64}
-coverage_target_points_blockwise(domain; block_size) -> Matrix{Float64}
-```
-Sample coverage target points from the domain mask.
-
-### Tree Initialization
-
-```julia
-growth_tree_from_xcat(name::String, tree::XCATCenterlineTree) -> GrowthTree
-```
-Convert an XCAT centerline tree into a mutable `GrowthTree`.
-
-```julia
-growth_tree_from_seed(name::String, seed_point_cm::SVector{3,Float64};
-                      terminal_diameter_cm::Float64=0.004) -> GrowthTree
-```
-Create a single-vertex `GrowthTree` at the given seed coordinate.
-
-```julia
-subdivide_terminals!(tree::GrowthTree;
-                     target_diameter_cm::Float64,
-                     gamma::Float64=3.0,
-                     branch_half_angle::Float64=0.4,
-                     ld_ratio::Float64=12.0,
-                     domain::Union{Nothing, VoxelShellDomain}=nothing)
-```
-Recursively bifurcate every terminal until segment diameter reaches
-`target_diameter_cm`. Pass `domain` to clip sub-branches that would leave the
-voxel mask (uses 8-attempt rotation retry per split).
-
-```julia
-smooth_junction_taper!(tree::GrowthTree; gamma::Float64=3.0)
-```
-Optional post-pass: at each XCAT↔grown junction, distribute the Murray-residual
-flow budget among grown children and apply an exponentially decaying diameter
-boost through their subtrees. Not needed in the strict-Murray regime (all
-diameters are already Murray-derived).
-
-```julia
-point_in_domain(domain::VoxelShellDomain, pt) -> Bool
-```
-Test whether a point (cm) lies inside the voxel mask. Used internally by
-`subdivide_terminals!` for boundary-aware clipping.
-
-### Graph and Routing
-
-```julia
-build_domain_graph(points_cm::Matrix{Float64}, domain; k) -> DomainGraph
-```
-Build a k-nearest-neighbor graph over domain points with midwall-cost-weighted edges.
-
-### Growth
-
-```julia
-grow_trees_mcp!(trees::Dict{String,GrowthTree}, domain; ...) -> (graph, territories, stats)
-```
-Run competitive round-robin MCP growth on all trees simultaneously. Returns the
-domain graph, per-tree territory indices, and per-tree statistics (terminals, P50,
-P95, max distance, branches added).
-
-### Export
-
-```julia
-write_growth_csv(path, branch_name, tree::GrowthTree) -> path
-```
-Write the tree to a CSV file with topology columns.
-
-```julia
-growth_viewer_html(path, domain, trees, stats, color_map)
-```
-Generate an interactive Plotly-based HTML viewer.
-
-### Top-Level
-
-```julia
-run_growth(config::OrganConfig; output_dir="output") -> NamedTuple
-```
-End-to-end pipeline: parse NRB, build domain, initialize trees, grow, export CSVs
-and viewer. Returns a named tuple with fields `html_path`, `domain`,
-`coverage_points`, `trees`, `territories`, and `stats`.
-
-## Algorithms
-
-### Minimum-Cost-Path (MCP) Growth
-
-Each growth round selects frontier targets -- domain points that are farthest from
-any existing vessel segment and owned by the current tree's territory. For each
-target, the nearest existing tree vertex is chosen as an anchor, and Dijkstra's
-algorithm finds the lowest-cost path through the domain graph from anchor to target.
-The path is smoothed, resampled, and added as a new branch.
-
-### Heap-Based Dijkstra
-
-Shortest paths are computed using a binary-heap priority queue implementation
-(`_shortest_path`). Edge costs combine Euclidean distance with a midwall-proximity
-penalty so that paths prefer the interior of the myocardial shell over regions near
-surfaces.
-
-### Catmull-Rom Smoothing
-
-Raw graph paths are resampled using Catmull-Rom spline interpolation
-(`_catmull_rom_resample`) with configurable `spline_density` points per span. This is
-followed by domain-constrained Laplacian smoothing (`_smooth_path_in_domain`) that
-averages each interior waypoint with its neighbors while rejecting moves that exit
-the domain mask.
-
-### Strict Murray-Derived Diameters
-
-Every segment diameter -- XCAT and grown -- is derived purely from its subtree
-terminal count:
-
-```
-d = d_term × N_terminals^(1/γ)
-```
-
-where `γ` defaults to 3.0 (classic Murray) and `d_term` is the tree's terminal
-(leaf) diameter. This makes Murray's law hold at every junction by construction,
-not just where branches are added. The XCAT ostium diameter acts only as a
-capacity ceiling: before adding a new terminal, `_can_add_terminal_at_anchor`
-rejects the branch if `total_terminals + 1 > (d_root / d_term)^γ`.
-
-### Hybrid Growth + Subdivision
-
-Direct growth to 8 μm terminals saturates coverage at ~10⁴ terminals, which under
-Murray gives sub-mm root diameters (unphysiological). The hybrid pipeline splits
-the problem:
-
-1. **Growth phase** at `terminal_diameter_cm` (e.g. 200 μm) -- the MCP routing
-   layer pushes branches until coverage stalls. This yields realistic
-   mm-scale root diameters.
-2. **Subdivision phase** at `subdivision_terminal_diameter_cm` (e.g. 8 μm) --
-   `subdivide_terminals!` recursively bifurcates each tip with symmetric Murray
-   splits (`d_child = d_parent / 2^(1/γ)`), doubling the tree depth until the
-   target diameter is reached. `_recompute_all_murray!` then walks the whole
-   tree bottom-up and re-derives every diameter from the new leaf counts, so the
-   `d = d_term × N^(1/γ)` identity remains globally exact.
-
-Subdivision is domain-aware: each candidate child vertex is tested against the
-voxel mask, and up to eight random rotations of the bifurcation plane are tried
-to find one where both children land inside the shell. Without the rotation
-retry, a single unlucky direction near the boundary can cascade into losing
-~2^depth descendants and producing visible holes in the perfused tissue.
-
-### Chamber vs. Tubular Cavity Handling
-
-Cardiac cavities span two very different shape classes: chambers (LV, RV, LA,
-RA) whose centroids land inside the organ wall, and tubes (aorta, SVC, IVC)
-whose centroids fall outside. `build_voxel_shell_domain_floodfill` auto-detects
-the class from the centroid's location relative to `outer_interior` and:
-
-- For chambers: standard SDF subtraction + centroid-seeded flood fill.
-- For tubes: SDF subtraction bounded at 2 cm (Euclidean distance to nearest
-  surface sample), plus a fallback seed that scans for any allowed voxel if the
-  centroid-based seed is invalid. This prevents the unbounded SDF from
-  subtracting large regions of perfectly valid wall far from the tube.
-
-### Competitive Round-Robin
-
-Multiple trees grow simultaneously in a round-robin schedule. A global distance
-array tracks, for every coverage point, the nearest segment across all trees and
-which tree owns it. Each round, every tree selects frontier targets only from its
-own territory (points closer to it than to any other tree). After a tree adds
-branches, the global distances are incrementally updated. This produces realistic
-territorial partitioning analogous to coronary perfusion territories.
-
-## References
-
-1. **Kassab, G.S. et al.** (1993). "Morphometry of pig coronary arterial trees."
-   *American Journal of Physiology -- Heart and Circulatory Physiology*, 265(1),
-   H350--H365. Foundational morphometric data for coronary arterial branching.
-
-2. **Huo, Y. and Kassab, G.S.** (2007). "A scaling law of vascular volume."
-   *Biophysical Journal*, 92(10), 3554--3562. Scaling relationships used to
-   calibrate supply radii and terminal diameters.
-
-3. **Murray, C.D.** (1926). "The physiological principle of minimum work. I. The
-   vascular system and the cost of blood volume." *Proceedings of the National
-   Academy of Sciences*, 12(3), 207--214. The cubic law (`d^3 = sum d_i^3`)
-   governing optimal vessel diameter at bifurcations.
+| LAD | 47 | 166 | 3.5× |
+| LCX | 52 | 179 | 3.4× |
+| RCA | 57 | 196 | 3.4× |
+| total | **157** | **541** | — |
+
+Clinical literature baseline ~150 mL/min, peak hyperemic 400-700 mL/min, CFR 3-5× — all in range.
