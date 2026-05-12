@@ -2,49 +2,48 @@
 # scale_to_rest.jl
 #
 # Convert a max-dilated coronary tree CSV to an at-rest tree by applying a
-# diameter-dependent arteriolar tone factor.
+# diameter-band arteriolar tone factor.
 #
 # Why: Murray's law (d_parent³ = sum d_child³) gives the energetically optimal
 # vessel diameters at the point of maximum dilation (smooth muscle fully
 # relaxed). In real physiology, the at-rest state is reached by constricting
 # small arteries / arterioles via myogenic + metabolic + neural tone. The
-# largest dilation reserve sits at ~100 μm arterioles (CFR primary regulators);
-# capillaries (no smooth muscle) and large conduit arteries (sparse smooth
-# muscle, structural rigidity) barely change.
+# active-tone band sits at ~10–400 μm (small arteries + arterioles); conduits
+# (> 1 mm, sparse SM + structural rigidity) and capillaries (< 10 μm, no SM)
+# barely change.
 #
-# Model: bell curve in log10(D) centered at 100 μm, peak constriction
-# fraction `tone_max`. Default tone_max=0.4 → at peak D_at_rest = 0.6·D_max.
-# Width=0.4 (log10 units) tapers smoothly across the arteriolar band.
+# Model: hard band in raw diameter. Default tone = 0.375, i.e. inside [10, 400]
+# μm at_rest_D = (1 − 0.375) × max_dilated_D = 0.625 × max_dilated_D, giving
+# a clinical dilation reserve of 1 / 0.625 = 1.6× (vessel area × 2.56, flow ×
+# ≈ 6.5 under Poiseuille — typical coronary CFR).
 #
-#   D = 6 μm    -> scale ≈ 0.996  (capillary unchanged)
-#   D = 50 μm   -> scale ≈ 0.70
-#   D = 100 μm  -> scale ≈ 0.60   (peak arteriole constriction)
-#   D = 500 μm  -> scale ≈ 0.91
-#   D = 1 mm    -> scale ≈ 0.98
-#   D = 3.7 mm  -> scale ≈ 1.000  (conduit unchanged)
+#   D = 6 μm    -> scale = 1.000  (capillary unchanged)
+#   D = 10 μm   -> scale = 0.625  (in band)
+#   D = 100 μm  -> scale = 0.625  (in band)
+#   D = 400 μm  -> scale = 0.625  (in band)
+#   D = 401 μm  -> scale = 1.000  (conduit unchanged)
+#   D = 3.7 mm  -> scale = 1.000  (conduit unchanged)
 #
 # Usage:
 #   julia --project=. scripts/scale_to_rest.jl <input_csv> <output_csv> \
-#         [tone_max=0.4] [width=0.4] [center_um=100]
+#         [tone=0.375] [d_low_um=10.0] [d_high_um=400.0]
 
 using Printf
 
 function tone_factor(d_um::Float64;
-                     center_log10::Float64=2.0,
-                     width::Float64=0.4,
-                     tone_max::Float64=0.4)
-    z = (log10(d_um) - center_log10) / width
-    g = exp(-0.5 * z * z)
-    return 1.0 - tone_max * g
+                     d_low_um::Float64=10.0,
+                     d_high_um::Float64=400.0,
+                     tone::Float64=0.375)
+    return (d_low_um <= d_um <= d_high_um) ? (1.0 - tone) : 1.0
 end
 
-length(ARGS) >= 2 || error("Usage: scale_to_rest.jl <input_csv> <output_csv> [tone_max] [width] [center_um]")
+length(ARGS) >= 2 || error("Usage: scale_to_rest.jl <input_csv> <output_csv> [tone] [d_low_um] [d_high_um]")
 
 const INPUT  = ARGS[1]
 const OUTPUT = ARGS[2]
-const TONE_MAX     = length(ARGS) >= 3 ? parse(Float64, ARGS[3]) : 0.4
-const WIDTH        = length(ARGS) >= 4 ? parse(Float64, ARGS[4]) : 0.4
-const CENTER_LOG10 = length(ARGS) >= 5 ? log10(parse(Float64, ARGS[5])) : 2.0
+const TONE      = length(ARGS) >= 3 ? parse(Float64, ARGS[3]) : 0.375
+const D_LOW_UM  = length(ARGS) >= 4 ? parse(Float64, ARGS[4]) : 10.0
+const D_HIGH_UM = length(ARGS) >= 5 ? parse(Float64, ARGS[5]) : 400.0
 
 const DIAM_COL_1BASED = 14   # CSV layout: branch,segment_id,parent_segment_id,
                              # x1,y1,z1,x2,y2,z2,xmid,ymid,zmid,length_mm,
@@ -52,15 +51,15 @@ const DIAM_COL_1BASED = 14   # CSV layout: branch,segment_id,parent_segment_id,
 
 # Quick preview of the tone function
 println("Tone function preview:")
-for d in (3700.0, 1000.0, 500.0, 200.0, 100.0, 50.0, 20.0, 10.0, 6.0)
-    s = tone_factor(d; center_log10=CENTER_LOG10, width=WIDTH, tone_max=TONE_MAX)
+for d in (3700.0, 1000.0, 500.0, 401.0, 400.0, 200.0, 100.0, 50.0, 20.0, 10.0, 9.9, 6.0)
+    s = tone_factor(d; d_low_um=D_LOW_UM, d_high_um=D_HIGH_UM, tone=TONE)
     @printf("  D = %7.1f μm  ->  scale = %.4f  ->  D_rest = %7.2f μm\n", d, s, d * s)
 end
 println()
 
 println("Reading  : $INPUT")
 println("Writing  : $OUTPUT")
-println("tone_max : $TONE_MAX   width: $WIDTH (log10)   center: $(10^CENTER_LOG10) μm")
+println("tone     : $TONE   band: [$(D_LOW_UM), $(D_HIGH_UM)] μm   (dilation reserve = $(round(1/(1-TONE); digits=2))x)")
 println("-" ^ 80)
 
 # Diameter histogram bins (log10 μm)
@@ -68,8 +67,6 @@ const HIST_EDGES = collect(0.0:0.25:4.0)
 const N_BINS = length(HIST_EDGES) - 1
 counts_in  = zeros(Int, N_BINS)
 counts_out = zeros(Int, N_BINS)
-d_min_in,  d_max_in  = Inf, -Inf
-d_min_out, d_max_out = Inf, -Inf
 
 @inline function hist_bin!(counts::Vector{Int}, d::Float64)
     d <= 0 && return
@@ -81,7 +78,7 @@ d_min_out, d_max_out = Inf, -Inf
 end
 
 function process_csv(input::String, output::String;
-                     center_log10::Float64, width::Float64, tone_max::Float64,
+                     d_low_um::Float64, d_high_um::Float64, tone::Float64,
                      counts_in::Vector{Int}, counts_out::Vector{Int})
     t0 = time()
     n = 0
@@ -97,7 +94,7 @@ function process_csv(input::String, output::String;
             isempty(line) && continue
             cols = split(line, ',', limit=15)
             d_in = parse(Float64, cols[DIAM_COL_1BASED])
-            sc   = tone_factor(d_in; center_log10=center_log10, width=width, tone_max=tone_max)
+            sc   = tone_factor(d_in; d_low_um=d_low_um, d_high_um=d_high_um, tone=tone)
             d_out = d_in * sc
 
             for i in 1:DIAM_COL_1BASED-1
@@ -133,7 +130,7 @@ function process_csv(input::String, output::String;
 end
 
 stats = process_csv(INPUT, OUTPUT;
-                    center_log10=CENTER_LOG10, width=WIDTH, tone_max=TONE_MAX,
+                    d_low_um=D_LOW_UM, d_high_um=D_HIGH_UM, tone=TONE,
                     counts_in=counts_in, counts_out=counts_out)
 
 @printf("\nWrote %d rows in %.1fs (%.0fk rows/s)\n",
