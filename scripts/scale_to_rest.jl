@@ -12,26 +12,36 @@
 # (> 1 mm, sparse SM + structural rigidity) and capillaries (< 10 μm, no SM)
 # barely change.
 #
-# Model: hard band in raw diameter. Default tone = 0.375, i.e. inside [10, 400]
-# μm at_rest_D = (1 − 0.375) × max_dilated_D = 0.625 × max_dilated_D, giving
-# a clinical dilation reserve of 1 / 0.625 = 1.6× (vessel area × 2.56, flow ×
-# ≈ 6.5 under Poiseuille — typical coronary CFR).
+# Model: hard band in raw diameter. Default tone = 0.375 over (0, 400] μm:
+# at_rest_D = (1 − 0.375) × max_dilated_D = 0.625 × max_dilated_D, dilation
+# reserve 1 / 0.625 = 1.6× (vessel area × 2.56, single-vessel flow × ≈ 6.5
+# under Poiseuille — typical coronary CFR). Everything from the smallest
+# capillary (~6 μm) up to 400 μm is in the band; conduits above 400 μm
+# (sparse SM + structural rigidity) are unchanged. Configurable via CLI.
 #
-#   D = 6 μm    -> scale = 1.000  (capillary unchanged)
+#   D = 6 μm    -> scale = 0.625  (capillary in band)
 #   D = 10 μm   -> scale = 0.625  (in band)
 #   D = 100 μm  -> scale = 0.625  (in band)
 #   D = 400 μm  -> scale = 0.625  (in band)
 #   D = 401 μm  -> scale = 1.000  (conduit unchanged)
 #   D = 3.7 mm  -> scale = 1.000  (conduit unchanged)
 #
+# Note: at-rest capillaries end up at ~3.9 μm (= 6.25 × 0.625), still above
+# the Pries 1992 D = 2.7 μm RBC-blockage threshold, but deep in the rising
+# branch of the F-L curve. Apparent viscosity at 3.9 μm is ~2× that at 6 μm,
+# so capillary segment R rises ~13× per segment vs the max-dilated tree.
+# The capillaries are leaves (millions in parallel), so the net effect on
+# total tree R is moderate — most of the at-rest R increase comes from the
+# 10-400 μm arteriole segments in series.
+#
 # Usage:
 #   julia --project=. scripts/scale_to_rest.jl <input_csv> <output_csv> \
-#         [tone=0.375] [d_low_um=10.0] [d_high_um=400.0]
+#         [tone=0.375] [d_low_um=0.0] [d_high_um=400.0]
 
 using Printf
 
 function tone_factor(d_um::Float64;
-                     d_low_um::Float64=10.0,
+                     d_low_um::Float64=0.0,
                      d_high_um::Float64=400.0,
                      tone::Float64=0.375)
     return (d_low_um <= d_um <= d_high_um) ? (1.0 - tone) : 1.0
@@ -42,7 +52,7 @@ length(ARGS) >= 2 || error("Usage: scale_to_rest.jl <input_csv> <output_csv> [to
 const INPUT  = ARGS[1]
 const OUTPUT = ARGS[2]
 const TONE      = length(ARGS) >= 3 ? parse(Float64, ARGS[3]) : 0.375
-const D_LOW_UM  = length(ARGS) >= 4 ? parse(Float64, ARGS[4]) : 10.0
+const D_LOW_UM  = length(ARGS) >= 4 ? parse(Float64, ARGS[4]) : 0.0
 const D_HIGH_UM = length(ARGS) >= 5 ? parse(Float64, ARGS[5]) : 400.0
 
 const DIAM_COL_1BASED = 14   # CSV layout: branch,segment_id,parent_segment_id,
