@@ -1,47 +1,58 @@
 #!/usr/bin/env julia
 # scale_to_rest.jl
 #
-# Convert a max-dilated coronary tree CSV to an at-rest tree by applying a
-# diameter-band arteriolar tone factor.
+# Convert a max-hyperemia (Murray-grown) coronary tree CSV to the at-rest
+# (anatomical-at-100-mmHg) tree by reversing the Wong-Molloi 2008 empirical
+# 1.6× resistance-vessel multiplier.
 #
-# Why: Murray's law (d_parent³ = sum d_child³) gives the energetically optimal
-# vessel diameters at the point of maximum dilation (smooth muscle fully
-# relaxed). In real physiology, the at-rest state is reached by constricting
-# small arteries / arterioles via myogenic + metabolic + neural tone. The
-# active-tone band sits at ~10–400 μm (small arteries + arterioles); conduits
-# (> 1 mm, sparse SM + structural rigidity) and capillaries (< 10 μm, no SM)
-# barely change.
+# Physiological model (Wong-Molloi 2008, Phys Med Biol 53:3995, eq. unnumbered
+# at p. 4000):
 #
-# Model: hard band in raw diameter. Default tone = 0.375 over (0, 400] μm:
-# at_rest_D = (1 − 0.375) × max_dilated_D = 0.625 × max_dilated_D, dilation
-# reserve 1 / 0.625 = 1.6× (vessel area × 2.56, single-vessel flow × ≈ 6.5
-# under Poiseuille — typical coronary CFR). Everything from the smallest
-# capillary (~6 μm) up to 400 μm is in the band; conduits above 400 μm
-# (sparse SM + structural rigidity) are unchanged. Configurable via CLI.
+#     "arterioles (diameters ⩽ 400 μm) of the LCX, LAD and RCA
+#      were uniformly dilated by a factor of 1.6"
 #
-#   D = 6 μm    -> scale = 0.625  (capillary in band)
-#   D = 10 μm   -> scale = 0.625  (in band)
+# That factor encodes the dilation reserve from the at-rest state (full
+# autoregulatory tone in the resistance band) to maximum hyperemia
+# (arteriolar smooth muscle fully relaxed, e.g. under adenosine). It was
+# empirically chosen to match Pantely 1984 / Fearon 2004 in-vivo LAD
+# resistance, not derived from independent physiology.
+#
+# The Wong-Molloi reconstruction (Kassab 1993 + Mittal 2005) goes down to
+# 8 μm pre-capillary arterioles. We follow their cut-off — vessels below
+# 8 μm are capillaries (no smooth muscle) and stay at their max-dilated
+# diameter; vessels above 400 μm are conduit/conductance arteries
+# (sparse SM + structural rigidity) and likewise don't participate in
+# autoregulatory tone. Only 8 μm ≤ d ≤ 400 μm is the active resistance band.
+#
+# Hard band, no smoothing:
+#     d_at_rest / d_max_hyper = (1 − tone)   in band
+#     d_at_rest / d_max_hyper = 1.0          outside band
+#
+# With tone = 0.375: d_at_rest = 0.625 × d_max_hyper inside [8, 400] μm,
+# equivalent to a per-vessel 1/0.625 = 1.6× dilation reserve.
+#
+#   D = 6 μm    -> scale = 1.000  (capillary, no SM)
+#   D = 8 μm    -> scale = 0.625  (lower band edge — pre-capillary arteriole)
 #   D = 100 μm  -> scale = 0.625  (in band)
-#   D = 400 μm  -> scale = 0.625  (in band)
+#   D = 400 μm  -> scale = 0.625  (upper band edge)
 #   D = 401 μm  -> scale = 1.000  (conduit unchanged)
 #   D = 3.7 mm  -> scale = 1.000  (conduit unchanged)
 #
-# Note: at-rest capillaries end up at ~3.9 μm (= 6.25 × 0.625), still above
-# the Pries 1992 D = 2.7 μm RBC-blockage threshold, but deep in the rising
-# branch of the F-L curve. Apparent viscosity at 3.9 μm is ~2× that at 6 μm,
-# so capillary segment R rises ~13× per segment vs the max-dilated tree.
-# The capillaries are leaves (millions in parallel), so the net effect on
-# total tree R is moderate — most of the at-rest R increase comes from the
-# 10-400 μm arteriole segments in series.
+# Wong-Molloi also describe a passive pressure-diameter curve (Cornelissen
+# 2000, eq. 12) that adjusts each segment's diameter based on its local
+# perfusion pressure. That curve is independent of and additive to this
+# autoregulatory tone factor, and is not applied here — it would require
+# iterative coupling with the flow solver. See hemodynamics.jl for any
+# future implementation.
 #
 # Usage:
 #   julia --project=. scripts/scale_to_rest.jl <input_csv> <output_csv> \
-#         [tone=0.375] [d_low_um=0.0] [d_high_um=400.0]
+#         [tone=0.375] [d_low_um=8.0] [d_high_um=400.0]
 
 using Printf
 
 function tone_factor(d_um::Float64;
-                     d_low_um::Float64=0.0,
+                     d_low_um::Float64=8.0,
                      d_high_um::Float64=400.0,
                      tone::Float64=0.375)
     return (d_low_um <= d_um <= d_high_um) ? (1.0 - tone) : 1.0
@@ -52,7 +63,7 @@ length(ARGS) >= 2 || error("Usage: scale_to_rest.jl <input_csv> <output_csv> [to
 const INPUT  = ARGS[1]
 const OUTPUT = ARGS[2]
 const TONE      = length(ARGS) >= 3 ? parse(Float64, ARGS[3]) : 0.375
-const D_LOW_UM  = length(ARGS) >= 4 ? parse(Float64, ARGS[4]) : 0.0
+const D_LOW_UM  = length(ARGS) >= 4 ? parse(Float64, ARGS[4]) : 8.0
 const D_HIGH_UM = length(ARGS) >= 5 ? parse(Float64, ARGS[5]) : 400.0
 
 const DIAM_COL_1BASED = 14   # CSV layout: branch,segment_id,parent_segment_id,
