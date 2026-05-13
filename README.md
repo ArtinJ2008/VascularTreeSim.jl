@@ -95,12 +95,25 @@ equal-length pieces at the same diameter. Preserves Murray (d unchanged) and
 keeps Poiseuille resistance physically reasonable.
 
 **At-rest tree (`scripts/scale_to_rest.jl`).** Murray-optimal diameters
-correspond to maximum vasodilation. To produce the at-rest state, scale
-arteriolar diameters via a bell curve in log10(D) centered at 100 μm —
-conduit vessels (> 1 mm) and capillaries (< 10 μm) are nearly unchanged;
-peak arterioles (~100 μm) shrink by `tone_max` (default 0.4, recommended 0.55
-for clinical coronary CFR). The flow simulator then treats the two CSV sets
-as the same anatomy in two different smooth-muscle states.
+correspond to maximum vasodilation. To produce the at-rest state, apply
+a hard diameter band — Wong & Molloi 2008 (*Phys Med Biol* 53:3995)
+empirically dilate every arteriole in `[8, 400]` μm by a factor of 1.6
+under max hyperemia. Reversing the factor gives the at-rest geometry:
+
+```
+d_at_rest = d_max_dilated × (1 − tone)   if D_LOW ≤ d_max_dilated ≤ D_HIGH
+          = d_max_dilated                otherwise
+```
+
+Defaults: `tone = 0.375` (= 1 − 1/1.6 → 1.6× reserve), `D_LOW = 8 μm`
+(Kassab pre-capillary), `D_HIGH = 400 μm` (resistance/conductance boundary).
+Capillaries (no smooth muscle, < 8 μm) and conduits (> 400 μm) are unchanged.
+
+The flow simulator treats the two CSV sets as the same anatomy in two
+different smooth-muscle states. The Wong-Molloi paper also describes a
+Cornelissen 2000 passive pressure-diameter curve (eq. 12) that adds local-
+pressure dependence on top of the tone factor; not implemented here — would
+require iterative coupling with the flow solver.
 
 ---
 
@@ -142,8 +155,9 @@ To produce the at-rest tree (used by FlowContrastSim's baseline config):
 for tree in lad lcx rca; do
   julia --project=. scripts/scale_to_rest.jl \
         output/${tree}_segments.csv \
-        output_at_rest/${tree}_segments.csv \
-        0.55   # tone_max — peak arteriole D × 0.45
+        output_at_rest/${tree}_segments.csv
+        # defaults: tone=0.375  d_low_um=8.0  d_high_um=400.0
+        # (= Wong-Molloi 2008 spec: 1.6× reserve in [8, 400] μm band)
 done
 ```
 
@@ -302,13 +316,24 @@ See `src/VascularTreeSim.jl` for the full export list.
 3. (Optional) `julia scripts/scale_to_rest.jl …` for each tree to produce `output_at_rest/`.
 4. Hand the two CSV directories to `FlowContrastSim.jl/scripts/natural_flow_summary.jl` with `configs/coronary_baseline.toml` and `configs/coronary_hyperemic.toml`.
 
-Expected flow numbers (cap_R = 0.15 mmHg·min/mL/100 g, tone_max = 0.55):
+Expected flow numbers (Wong-Molloi 2008 alignment: scale_to_rest tone =
+0.375, band [8, 400] μm, 1.6× reserve; baseline cap_R = 0.15 + hyperemic
+cap_R = 0.12 mmHg·min/mL/100g for the literature plus a small autoregulatory
+cap-bed relaxation):
 
 | tree | baseline (mL/min) | hyperemic (mL/min) | CFR |
 |---|---|---|---|
-| LAD | 47 | 166 | 3.5× |
-| LCX | 52 | 179 | 3.4× |
-| RCA | 57 | 196 | 3.4× |
-| total | **157** | **541** | — |
+| LAD | 58.4 | 184.0 | 3.15× |
+| LCX | 64.9 | 199.9 | 3.08× |
+| RCA | 71.5 | 220.5 | 3.08× |
+| **total** | **195** | **604** | — |
 
-Clinical literature baseline ~150 mL/min, peak hyperemic 400-700 mL/min, CFR 3-5× — all in range.
+Per-tree baseline numbers slightly above the 30-60 mL/min textbook range
+because the strict Wong-Molloi 1.6× reserve was empirically calibrated
+to Pantely 1984 / Fearon 2004 swine data, not to our tree's exact total
+resistance. CFR 3.0-3.2× sits squarely in clinical 3-5× range. Total
+flow ~195 (rest) / 604 (max hyperemia) match population means.
+
+For a closed-loop autoregulation simulation (arterioles dilate up to
+1.6× to maintain target flow as stenosis grows), see FlowContrastSim's
+`scripts/lad_stenosis_autoreg_sweep.jl`.
