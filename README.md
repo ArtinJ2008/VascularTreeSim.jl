@@ -337,3 +337,23 @@ flow ~195 (rest) / 604 (max hyperemia) match population means.
 For a closed-loop autoregulation simulation (arterioles dilate up to
 1.6× to maintain target flow as stenosis grows), see FlowContrastSim's
 `scripts/lad_stenosis_autoreg_sweep.jl`.
+
+---
+
+## Phantom voxelization scripts
+
+For the perfusion-pipeline (CT virtual scans, real-patient AIF, etc.),
+trees need to be rasterized into the XCAT digital phantom. Three companion
+scripts live under `scripts/`:
+
+| script | role |
+|---|---|
+| `voxelize_csv_into_phantom.jl` | no-contrast pass: sub-voxel Monte Carlo to accumulate per-voxel f_blood + UInt16 100-bin volume-fraction quantization. Replaces myocardium voxels (labels 15-18) with blood mixture labels 256-355. Pre-step before contrast voxelization |
+| `apply_contrast_at_peak.jl` | peak-iodine pass: reads `peak_iodine.f32` per tree (from `FlowContrastSim/scripts/extract_peak_iodine.jl`) and writes a UInt16 cross-product (100 blood bins × 101 iodine bins) phantom for BasisSim. Single-time-point — for dynamic, see below |
+| `voxelize_dynamic_contrast.jl` | 4D (X, Y, Z, T) dynamic-contrast pass: reads per-segment arrival_time.f32 + sub-voxel MC + accumulates f_blood (time-invariant) + f_iodine_w[V, ti] (T frames). Output: one Float32 .raw per frame (1600×1400×500 × 4 B = 4.48 GB each) at iodine mg/mL of blood phase, plus a clipped Float32 f_blood file and a manifest TOML. Uses per-thread Gaussian-dispersed gamma sampling at the per-segment arrival; takes T_END_S and N_FRAMES as CLI args |
+
+The `voxelize_dynamic_contrast.jl` output (Float32 frames) is the closest
+analog of the 4D `(x,y,z,t)` iodine concentration array a downstream
+consumer would want; the perfusion-pipeline `make_basissim_phantoms.jl`
+sibling instead encodes one specific time-point's voxelization as UInt16
+cross-product labels for BasisSim physics simulation.
