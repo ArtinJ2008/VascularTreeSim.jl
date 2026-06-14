@@ -105,6 +105,22 @@ function _choose_competitive_frontiers(global_min_dist::Vector{Float64}, owner::
     return chosen
 end
 
+function _segment_stays_in_domain(domain::VoxelShellDomain,
+                                  a::SVector{3, Float64},
+                                  b::SVector{3, Float64})
+    point_in_domain(domain, a) || return false
+    point_in_domain(domain, b) || return false
+    dist = norm(b - a)
+    step = max(minimum(domain.spacing_cm) / 3, 1e-6)
+    n = max(1, ceil(Int, dist / step))
+    for i in 1:(n - 1)
+        t = i / n
+        p = (1.0 - t) .* a .+ t .* b
+        point_in_domain(domain, p) || return false
+    end
+    return true
+end
+
 # ── Main growth loop ──
 
 function grow_trees_mcp!(trees::Dict{String, GrowthTree}, domain;
@@ -126,6 +142,8 @@ function grow_trees_mcp!(trees::Dict{String, GrowthTree}, domain;
         use_gpu::Bool=gpu_available(),
         turn_penalty::Float64=0.5,
         graph_jitter_cm::Float64=-1.0,
+        snap_terminal_to_target::Bool=false,
+        max_terminal_snap_cm::Float64=Inf,
         tree_weights::Union{Nothing, Dict{String, Float64}}=nothing,
         territory_weights::Union{Nothing, Dict{String, Float64}}=nothing)
 
@@ -303,6 +321,14 @@ function grow_trees_mcp!(trees::Dict{String, GrowthTree}, domain;
                 path_ids = _shortest_path(graph, source_idx, target_idx; turn_penalty=turn_penalty)
                 path_points = _prepare_branch_path([graph.points[i] for i in path_ids], domain;
                     max_nodes=max_path_nodes, smooth_passes=smooth_passes, spline_density=spline_density)
+                if snap_terminal_to_target && !isempty(path_points)
+                    snap_distance = norm(p - path_points[end])
+                    if snap_distance > 1e-8 &&
+                            snap_distance <= max_terminal_snap_cm &&
+                            _segment_stays_in_domain(domain, path_points[end], p)
+                        push!(path_points, p)
+                    end
+                end
                 if _add_branch_path!(tree, anchor_vertex, path_points;
                         gamma=gamma,
                         max_branch_length_cm=Inf, max_segment_length_cm=max_segment_length_cm)

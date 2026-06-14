@@ -63,13 +63,18 @@ export load_organ_config
 
 # ── XCAT parsing ──
 export parse_xcat_nrb,
+       parse_xcat_grouped_nrb,
        xcat_object_dict,
+       xcat_bounds,
+       xcat_center,
+       xcat_group_name,
        xcat_sample_surface,
        xcat_centerline_from_surface,
        build_vessel_trees
 
 # ── Domain construction ──
 export build_voxel_shell_domain_floodfill,
+       build_multipatch_voxel_domain_floodfill,
        voxel_mask_points,
        coverage_target_points,
        coverage_target_points_blockwise,

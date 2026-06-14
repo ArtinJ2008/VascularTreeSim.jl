@@ -14,6 +14,33 @@ struct XCATNurbsSurface
     control_points::Array{SVector{3, Float64}, 2}
 end
 
+function xcat_bounds(surface::XCATNurbsSurface)
+    lo = SVector(Inf, Inf, Inf)
+    hi = SVector(-Inf, -Inf, -Inf)
+    for p in surface.control_points
+        lo = min.(lo, p)
+        hi = max.(hi, p)
+    end
+    return lo, hi
+end
+
+function xcat_center(surface::XCATNurbsSurface)
+    acc = SVector(0.0, 0.0, 0.0)
+    for p in surface.control_points
+        acc += p
+    end
+    return acc / length(surface.control_points)
+end
+
+function xcat_group_name(surface::XCATNurbsSurface)
+    return xcat_group_name(surface.name)
+end
+
+function xcat_group_name(name::AbstractString)
+    base = replace(String(name), r"__patch[0-9]+$" => "")
+    return replace(base, r"__occ[0-9]+$" => "")
+end
+
 function xcat_object_dict(surfaces::AbstractVector{XCATNurbsSurface})
     Dict(surface.name => surface for surface in surfaces)
 end
@@ -114,7 +141,9 @@ function xcat_sample_surface(surface::XCATNurbsSurface; n_u::Int=80, n_v::Int=80
 end
 
 function _parse_xcat_control_point(line::AbstractString)
-    parts = split(strip(line), ',')
+    token = strip(line)
+    parts = occursin(',', token) ? split(token, ',') : split(token)
+    length(parts) >= 3 || error("Expected x/y/z control point line, got `$token`")
     return SVector(parse(Float64, parts[1]), parse(Float64, parts[2]), parse(Float64, parts[3]))
 end
 
@@ -140,6 +169,12 @@ function _reshape_xcat_control_points(points::Vector{SVector{3, Float64}}, m::In
         k += 1
     end
     return grid
+end
+
+function _parse_xcat_dimension(line::AbstractString, tag::AbstractString, surface_name::AbstractString)
+    token = strip(line)
+    occursin(":$tag", token) || error("Expected :$tag dimension for $surface_name, got `$token`")
+    return parse(Int, strip(split(token, ':')[1]))
 end
 
 function parse_xcat_nrb(path::AbstractString)
@@ -176,5 +211,97 @@ function parse_xcat_nrb(path::AbstractString)
         control_points = _reshape_xcat_control_points(points, m, n)
         push!(surfaces, XCATNurbsSurface(name, m, n, u_knots, v_knots, control_points))
     end
+    return surfaces
+end
+
+"""
+    parse_xcat_grouped_nrb(path) -> Vector{XCATNurbsSurface}
+
+Parse grouped XCAT NRB files where each anatomical object is written as:
+
+```
+object_name
+material_or_object_code
+1.000000
+M :M
+N :N
+...
+```
+
+The provided thigh-muscle NRB uses one NURBS patch per object. Repeated object
+names get an `__occNNN` component so surface names remain unique.
+"""
+function parse_xcat_grouped_nrb(path::AbstractString)
+    lines = readlines(path)
+    surfaces = XCATNurbsSurface[]
+    object_counts = Dict{String, Int}()
+    i = 1
+
+    while i <= length(lines)
+        while i <= length(lines) && isempty(strip(lines[i]))
+            i += 1
+        end
+        i <= length(lines) || break
+        object_name = strip(lines[i])
+        i += 1
+        isempty(object_name) && continue
+        startswith(lowercase(object_name), "tmod_") && break
+        i <= length(lines) || break
+
+        object_code = tryparse(Int, strip(lines[i]))
+        if object_code === nothing
+            # This is not a grouped object header; keep scanning.
+            continue
+        end
+        i += 1
+
+        occurrence = get(object_counts, object_name, 0) + 1
+        object_counts[object_name] = occurrence
+        surface_name = occurrence == 1 ? object_name :
+            "$(object_name)__occ$(lpad(string(occurrence), 3, '0'))"
+
+        while i <= length(lines) && isempty(strip(lines[i]))
+            i += 1
+        end
+        i <= length(lines) || error("Unexpected EOF before $surface_name")
+
+        # XCAT writes a per-object scale/weight line here. The current surface
+        # evaluator does not use rational weights, but parsing the value
+        # validates that the stream is still aligned.
+        tryparse(Float64, strip(lines[i])) === nothing &&
+            error("Expected patch weight/scale before $surface_name, got `$(strip(lines[i]))`")
+        i += 1
+
+        i + 1 <= length(lines) || error("Unexpected EOF while reading dimensions for $surface_name")
+        m = _parse_xcat_dimension(lines[i], "M", surface_name)
+        n = _parse_xcat_dimension(lines[i + 1], "N", surface_name)
+        i += 2
+
+        i <= length(lines) && strip(lines[i]) == "U Knot Vector" ||
+            error("Expected U Knot Vector after $surface_name")
+        i += 1
+        u_knots, i = _parse_xcat_knot_vector(lines, i)
+
+        i <= length(lines) && strip(lines[i]) == "V Knot Vector" ||
+            error("Expected V Knot Vector after U knots for $surface_name")
+        i += 1
+        v_knots, i = _parse_xcat_knot_vector(lines, i)
+
+        i <= length(lines) && strip(lines[i]) == "Control Points" ||
+            error("Expected Control Points for $surface_name")
+        i += 1
+
+        n_points = m * n
+        points = Vector{SVector{3, Float64}}(undef, n_points)
+        for k in 1:n_points
+            i <= length(lines) || error("Unexpected EOF while reading control points for $surface_name")
+            points[k] = _parse_xcat_control_point(lines[i])
+            i += 1
+        end
+
+        control_points = _reshape_xcat_control_points(points, m, n)
+        push!(surfaces, XCATNurbsSurface(surface_name, m, n, u_knots, v_knots, control_points))
+    end
+
     return surfaces
 end

@@ -62,6 +62,7 @@ function shell_distance_components(domain::VoxelShellDomain, point)
 end
 
 function shell_midwall_cost(domain::VoxelShellDomain, point)
+    isempty(domain.cavity_surface_points) && return point_in_domain(domain, point) ? 1.0 : 1e6
     outer_sd, cavity_sd = shell_distance_components(domain, point)
     if outer_sd > 0 || cavity_sd < 0
         return 1e6
@@ -190,6 +191,22 @@ function _mark_triangle_voxels!(mask::BitArray{3}, origin::SVector{3, Float64}, 
     return mask
 end
 
+function _mark_surface_wall!(wall::BitArray{3}, surface::XCATNurbsSurface, origin::SVector{3, Float64},
+                             spacing::SVector{3, Float64}, dims::NTuple{3, Int};
+                             n_u::Int, n_v::Int, coordinate_scale::Float64=0.1)
+    vertices, _, nrows, ncols = _sample_surface_grid_domain(surface; n_u=n_u, n_v=n_v, orient_outward=true, coordinate_scale=coordinate_scale)
+    idx_fn(i, j) = (j - 1) * ncols + i
+    for j in 1:(nrows - 1), i in 1:(ncols - 1)
+        v11 = vertices[idx_fn(i, j)]
+        v21 = vertices[idx_fn(i + 1, j)]
+        v12 = vertices[idx_fn(i, j + 1)]
+        v22 = vertices[idx_fn(i + 1, j + 1)]
+        _mark_triangle_voxels!(wall, origin, spacing, v11, v21, v22)
+        _mark_triangle_voxels!(wall, origin, spacing, v11, v22, v12)
+    end
+    return wall
+end
+
 function _dilate_mask(mask::BitArray{3}, radius::Int)
     radius <= 0 && return copy(mask)
     out = copy(mask)
@@ -208,17 +225,8 @@ function _dilate_mask(mask::BitArray{3}, radius::Int)
 end
 
 function _surface_wall_mask(surface::XCATNurbsSurface, origin::SVector{3, Float64}, spacing::SVector{3, Float64}, dims::NTuple{3, Int}; n_u::Int, n_v::Int, coordinate_scale::Float64=0.1, dilation_radius::Int=1)
-    vertices, _, nrows, ncols = _sample_surface_grid_domain(surface; n_u=n_u, n_v=n_v, orient_outward=true, coordinate_scale=coordinate_scale)
     wall = falses(dims...)
-    idx_fn(i, j) = (j - 1) * ncols + i
-    for j in 1:(nrows - 1), i in 1:(ncols - 1)
-        v11 = vertices[idx_fn(i, j)]
-        v21 = vertices[idx_fn(i + 1, j)]
-        v12 = vertices[idx_fn(i, j + 1)]
-        v22 = vertices[idx_fn(i + 1, j + 1)]
-        _mark_triangle_voxels!(wall, origin, spacing, v11, v21, v22)
-        _mark_triangle_voxels!(wall, origin, spacing, v11, v22, v12)
-    end
+    _mark_surface_wall!(wall, surface, origin, spacing, dims; n_u=n_u, n_v=n_v, coordinate_scale=coordinate_scale)
     return _dilate_mask(wall, dilation_radius)
 end
 
@@ -483,4 +491,87 @@ function build_voxel_shell_domain_floodfill(outer_surface::XCATNurbsSurface, cav
     flush(stdout)
     center = 0.5 .* (lo .+ hi)
     return VoxelShellDomain(mask, lo, spacing, center, outer_points_s, outer_normals_s, cavity_points_s, cavity_normals_s, outer_grid, cavity_grids)
+end
+
+function _sample_multipatch_surface_matrices(surfaces::AbstractVector{XCATNurbsSurface};
+                                             n_u::Int, n_v::Int, orient_outward::Bool,
+                                             coordinate_scale::Float64=0.1)
+    isempty(surfaces) && error("Cannot sample an empty surface set")
+    point_mats = Matrix{Float64}[]
+    normal_mats = Matrix{Float64}[]
+    for surface in surfaces
+        pts, nrms = _surface_sample_matrices_domain(surface;
+            n_u=n_u,
+            n_v=n_v,
+            orient_outward=orient_outward,
+            coordinate_scale=coordinate_scale)
+        push!(point_mats, pts)
+        push!(normal_mats, _normalize_rows!(copy(nrms)))
+    end
+    return reduce(vcat, point_mats), reduce(vcat, normal_mats)
+end
+
+"""
+    build_multipatch_voxel_domain_floodfill(outer_surfaces; ...)
+
+Build a solid voxel domain from several NURBS patches that together describe
+one closed anatomical object, such as an XCAT skeletal muscle or limb surface.
+This is the non-heart equivalent of `build_voxel_shell_domain_floodfill`: it
+marks every patch into one wall mask and flood-fills from the volume boundary.
+"""
+function build_multipatch_voxel_domain_floodfill(outer_surfaces::AbstractVector{XCATNurbsSurface};
+        coordinate_scale::Float64=0.1,
+        voxel_spacing_cm::Float64=0.20,
+        outer_samples::Tuple{Int, Int}=(40, 40),
+        dilation_radius::Int=1,
+        coarse_seed_cm::Union{Nothing, SVector{3, Float64}}=nothing)
+
+    isempty(outer_surfaces) && error("At least one outer surface patch is required")
+    println("[domain] build_multipatch_voxel_domain_floodfill patches=$(length(outer_surfaces)) spacing=$(voxel_spacing_cm) cm")
+    flush(stdout)
+
+    outer_points_s, outer_normals_s = _sample_multipatch_surface_matrices(outer_surfaces;
+        n_u=outer_samples[1],
+        n_v=outer_samples[2],
+        orient_outward=true,
+        coordinate_scale=coordinate_scale)
+
+    lo_t = (minimum(@view outer_points_s[:,1]), minimum(@view outer_points_s[:,2]), minimum(@view outer_points_s[:,3]))
+    hi_t = (maximum(@view outer_points_s[:,1]), maximum(@view outer_points_s[:,2]), maximum(@view outer_points_s[:,3]))
+    outer_grid = _build_point_grid(outer_points_s, lo_t, hi_t)
+    lo = SVector(lo_t...) .- voxel_spacing_cm
+    hi = SVector(hi_t...) .+ voxel_spacing_cm
+    spacing = SVector(fill(voxel_spacing_cm, 3)...)
+    dims = ntuple(d -> max(1, Int(ceil((hi[d] - lo[d]) / spacing[d]))), 3)
+    println("[domain] dims=$(dims) sampled_outer_pts=$(size(outer_points_s, 1))")
+    flush(stdout)
+
+    outer_wall = falses(dims...)
+    for surface in outer_surfaces
+        _mark_surface_wall!(outer_wall, surface, lo, spacing, dims;
+            n_u=outer_samples[1],
+            n_v=outer_samples[2],
+            coordinate_scale=coordinate_scale)
+    end
+    outer_wall = _dilate_mask(outer_wall, dilation_radius)
+    println("[domain] multipatch wall ready vox=$(count(outer_wall))")
+    flush(stdout)
+
+    outside = _flood_fill_outside(outer_wall)
+    mask = .!outside .& .!outer_wall
+    println("[domain] multipatch interior vox=$(count(mask))")
+    flush(stdout)
+
+    if coarse_seed_cm !== nothing
+        seed = _mapped_midwall_seed(mask, lo, spacing, coarse_seed_cm)
+        if seed !== nothing
+            mask = _flood_fill_from_seed(falses(dims...), mask, seed)
+            println("[domain] selected connected component seed=$(seed) vox=$(count(mask))")
+            flush(stdout)
+        end
+    end
+
+    center = 0.5 .* (lo .+ hi)
+    return VoxelShellDomain(mask, lo, spacing, center, outer_points_s, outer_normals_s,
+        Matrix{Float64}[], Matrix{Float64}[], outer_grid, PointCloudGrid[])
 end
