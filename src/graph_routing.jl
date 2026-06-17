@@ -13,6 +13,31 @@ struct GraphSpatialGrid
     grid::PointCloudGrid
 end
 
+mutable struct RouteWorkspace
+    dist::Vector{Float64}
+    prev::Vector{Int}
+    seen::Vector{Int32}
+    closed::Vector{Int32}
+    stamp::Int32
+    heap::Vector{Tuple{Float64, Int}}
+end
+
+function RouteWorkspace(n::Int)
+    return RouteWorkspace(fill(Inf, n), zeros(Int, n), zeros(Int32, n),
+        zeros(Int32, n), Int32(0), Tuple{Float64, Int}[])
+end
+
+function _next_route_stamp!(workspace::RouteWorkspace)
+    if workspace.stamp == typemax(Int32)
+        fill!(workspace.seen, Int32(0))
+        fill!(workspace.closed, Int32(0))
+        workspace.stamp = Int32(0)
+    end
+    workspace.stamp += Int32(1)
+    empty!(workspace.heap)
+    return workspace.stamp
+end
+
 # ── k-nearest neighbor helpers ──
 
 function _sample_k_nearest(points::Vector{SVector{3, Float64}}, i::Int, k::Int)
@@ -168,6 +193,12 @@ function _heap_push!(heap::Vector{Tuple{Float64,Int}}, item::Tuple{Float64,Int})
     _heap_sift_up!(heap, length(heap))
 end
 
+function _heap_replace_min!(heap::Vector{Tuple{Float64,Int}}, item::Tuple{Float64,Int})
+    heap[1] = item
+    _heap_sift_down!(heap, 1)
+    return heap
+end
+
 function _heap_pop!(heap::Vector{Tuple{Float64,Int}})
     item = heap[1]
     last = pop!(heap)
@@ -228,6 +259,59 @@ function _shortest_path(graph::DomainGraph, source::Int, target::Int;
 end
 
 # ── Path processing: subsample, dedupe, smooth, Catmull-Rom ──
+
+function _shortest_path_astar!(workspace::RouteWorkspace, graph::DomainGraph,
+                               source::Int, target::Int; turn_penalty::Float64=0.0)
+    source == target && return [source]
+    stamp = _next_route_stamp!(workspace)
+    target_pt = graph.points[target]
+
+    workspace.dist[source] = 0.0
+    workspace.prev[source] = 0
+    workspace.seen[source] = stamp
+    _heap_push!(workspace.heap, (norm(graph.points[source] - target_pt), source))
+
+    while !isempty(workspace.heap)
+        _, u = _heap_pop!(workspace.heap)
+        workspace.closed[u] == stamp && continue
+        workspace.closed[u] = stamp
+        u == target && break
+
+        prev_u = workspace.prev[u]
+        u_pt = graph.points[u]
+        for (v, c) in zip(graph.neighbors[u], graph.costs[u])
+            tp = 0.0
+            if turn_penalty > 0.0 && prev_u != 0
+                dir_in = u_pt - graph.points[prev_u]
+                dir_out = graph.points[v] - u_pt
+                len_in = norm(dir_in)
+                len_out = norm(dir_out)
+                if len_in > 1e-10 && len_out > 1e-10
+                    cos_a = clamp(dot(dir_in, dir_out) / (len_in * len_out), -1.0, 1.0)
+                    tp = turn_penalty * (1.0 - cos_a) * 0.5 * len_out
+                end
+            end
+
+            alt = workspace.dist[u] + c + tp
+            if workspace.seen[v] != stamp || alt < workspace.dist[v]
+                workspace.seen[v] = stamp
+                workspace.dist[v] = alt
+                workspace.prev[v] = u
+                _heap_push!(workspace.heap, (alt + norm(graph.points[v] - target_pt), v))
+            end
+        end
+    end
+
+    workspace.seen[target] == stamp || return [source, target]
+    path = Int[]
+    u = target
+    while u != 0
+        push!(path, u)
+        u = workspace.prev[u]
+    end
+    reverse!(path)
+    return path
+end
 
 function _subsample_path(points::Vector{SVector{3, Float64}}; max_nodes::Int=12)
     n = length(points)

@@ -80,25 +80,52 @@ function _choose_competitive_frontiers(global_min_dist::Vector{Float64}, owner::
                                         tree_idx::Int, points_cm::Matrix{Float64};
                                         max_targets::Int, min_separation_cm::Float64,
                                         effective_supply_radius_cm::Float64,
-                                        weight::Float64=1.0)
+                                        weight::Float64=1.0,
+                                        candidate_factor::Int=0)
     # global_min_dist is EFFECTIVE distance (raw * 1/weight_owner). Since all
     # points here have owner == tree_idx, multiply by `weight` to recover raw.
     # Supply-radius comparison is in raw cm.
     scored = Tuple{Float64, Int}[]
+    candidate_limit = candidate_factor > 0 ? max(max_targets * candidate_factor, max_targets) : 0
     for i in eachindex(global_min_dist)
         owner[i] == tree_idx || continue
         d_raw = global_min_dist[i] * weight
         d_raw <= effective_supply_radius_cm && continue
-        push!(scored, (d_raw, i))
+        if candidate_limit == 0
+            push!(scored, (d_raw, i))
+        elseif length(scored) < candidate_limit
+            _heap_push!(scored, (d_raw, i))
+        elseif d_raw > scored[1][1]
+            _heap_replace_min!(scored, (d_raw, i))
+        end
     end
     sort!(scored, by=first, rev=true)
     chosen = Int[]
-    chosen_points = SVector{3, Float64}[]
+    sep2 = min_separation_cm * min_separation_cm
+    chosen_grid = Dict{NTuple{3, Int}, Vector{SVector{3, Float64}}}()
+    inv_sep = min_separation_cm > 0 ? 1.0 / min_separation_cm : Inf
     for (_, idx) in scored
         p = SVector(points_cm[idx, 1], points_cm[idx, 2], points_cm[idx, 3])
-        if all(norm(p - q) >= min_separation_cm for q in chosen_points)
+        ok = true
+        if min_separation_cm > 0
+            key = (floor(Int, p[1] * inv_sep), floor(Int, p[2] * inv_sep), floor(Int, p[3] * inv_sep))
+            for dz in -1:1, dy in -1:1, dx in -1:1
+                cell = get(chosen_grid, (key[1] + dx, key[2] + dy, key[3] + dz), nothing)
+                cell === nothing && continue
+                for q in cell
+                    if sum(abs2, p - q) < sep2
+                        ok = false
+                        break
+                    end
+                end
+                ok || break
+            end
+            if ok
+                push!(get!(chosen_grid, key, SVector{3, Float64}[]), p)
+            end
+        end
+        if ok
             push!(chosen, idx)
-            push!(chosen_points, p)
             length(chosen) >= max_targets && break
         end
     end
@@ -144,6 +171,9 @@ function grow_trees_mcp!(trees::Dict{String, GrowthTree}, domain;
         graph_jitter_cm::Float64=-1.0,
         snap_terminal_to_target::Bool=false,
         max_terminal_snap_cm::Float64=Inf,
+        use_indexed_anchor::Bool=false,
+        use_astar_routing::Bool=false,
+        frontier_candidate_factor::Int=0,
         tree_weights::Union{Nothing, Dict{String, Float64}}=nothing,
         territory_weights::Union{Nothing, Dict{String, Float64}}=nothing)
 
@@ -158,6 +188,7 @@ function grow_trees_mcp!(trees::Dict{String, GrowthTree}, domain;
     end
     graph = build_domain_graph(route_points_cm, domain; k=graph_neighbors)
     sgrid = _build_graph_spatial_grid(graph)
+    route_workspace = use_astar_routing ? RouteWorkspace(length(graph.points)) : nothing
     nt = Threads.nthreads()
     backend_str = use_gpu ? "GPU (CUDA)" : "CPU ($(nt) threads)"
     println("[growth] graph spatial grid ready — backend: $(backend_str)")
@@ -277,6 +308,7 @@ function grow_trees_mcp!(trees::Dict{String, GrowthTree}, domain;
     best_p95 = Inf
     stall_rounds = 0
     max_stall_rounds = 20   # stop if p95 hasn't improved in this many rounds
+    raw_dists = Vector{Float64}(undef, n_points)
 
     # Per-tree saturation tracking. Each tree's p95 is computed over its own
     # owned points (raw distance). When a tree's p95 stalls for max_stall_rounds
@@ -291,6 +323,7 @@ function grow_trees_mcp!(trees::Dict{String, GrowthTree}, domain;
     tree_saturated = Dict(name => false for name in branch_names)
 
     while true
+        round_started_at = time()
         round_num += 1
         round_progress = false
 
@@ -306,7 +339,8 @@ function grow_trees_mcp!(trees::Dict{String, GrowthTree}, domain;
                 global_min_dist, owner, ti, points_cm;
                 max_targets=batch, min_separation_cm=min_frontier_separation_cm,
                 effective_supply_radius_cm=effective_supply_radius_cm,
-                weight=w_ti)
+                weight=w_ti,
+                candidate_factor=frontier_candidate_factor)
             isempty(frontiers) && continue
 
             seg_before = length(tree.segment_start)
@@ -315,10 +349,17 @@ function grow_trees_mcp!(trees::Dict{String, GrowthTree}, domain;
                 # global_min_dist is effective; compare raw against supply radius
                 (global_min_dist[idx] * w_ti) <= effective_supply_radius_cm && continue
                 p = SVector(points_cm[idx, 1], points_cm[idx, 2], points_cm[idx, 3])
-                anchor_vertex, anchor_point = _choose_anchor_vertex(tree, p)
+                if use_indexed_anchor
+                    anchor_vertex, anchor_point = _choose_anchor_vertex_indexed!(tree, seg_indices[name], p)
+                else
+                    anchor_vertex, anchor_point = _choose_anchor_vertex(tree, p)
+                end
+                path_seg_before = length(tree.segment_start)
                 source_idx, _ = _nearest_graph_index(sgrid, anchor_point)
                 target_idx, _ = _nearest_graph_index(sgrid, p)
-                path_ids = _shortest_path(graph, source_idx, target_idx; turn_penalty=turn_penalty)
+                path_ids = use_astar_routing ?
+                    _shortest_path_astar!(route_workspace, graph, source_idx, target_idx; turn_penalty=turn_penalty) :
+                    _shortest_path(graph, source_idx, target_idx; turn_penalty=turn_penalty)
                 path_points = _prepare_branch_path([graph.points[i] for i in path_ids], domain;
                     max_nodes=max_path_nodes, smooth_passes=smooth_passes, spline_density=spline_density)
                 if snap_terminal_to_target && !isempty(path_points)
@@ -332,17 +373,24 @@ function grow_trees_mcp!(trees::Dict{String, GrowthTree}, domain;
                 if _add_branch_path!(tree, anchor_vertex, path_points;
                         gamma=gamma,
                         max_branch_length_cm=Inf, max_segment_length_cm=max_segment_length_cm)
+                    if use_indexed_anchor && length(tree.segment_start) > path_seg_before
+                        seg_indices[name] = update_segment_index!(seg_indices[name], tree, path_seg_before + 1)
+                    end
                     total_added[name] += 1
                     local_added += 1
                     round_progress = true
                     total_added[name] >= max_new_branches_per_tree && break
+                elseif use_indexed_anchor && length(tree.segment_start) > path_seg_before
+                    seg_indices[name] = update_segment_index!(seg_indices[name], tree, path_seg_before + 1)
                 end
             end
 
             # Incremental distance update
             seg_after = length(tree.segment_start)
             if seg_after > seg_before
-                seg_indices[name] = update_segment_index!(seg_indices[name], tree, seg_before + 1)
+                if !use_indexed_anchor
+                    seg_indices[name] = update_segment_index!(seg_indices[name], tree, seg_before + 1)
+                end
                 if use_gpu && gpu_state !== nothing
                     # GPU incremental: scan only new segments on device
                     _gpu_incremental_scan!(gpu_state, seg_indices[name], ti, seg_before + 1, seg_after; weight=w_ti)
@@ -357,7 +405,9 @@ function grow_trees_mcp!(trees::Dict{String, GrowthTree}, domain;
 
         # Status report (convert effective → raw for p95/max so physical
         # thresholds and stall detection remain in cm).
-        raw_dists = [raw_dist_at(i) for i in 1:n_points]
+        @inbounds for i in 1:n_points
+            raw_dists[i] = raw_dist_at(i)
+        end
         current_p95 = quantile(raw_dists, 0.95)
         current_max = maximum(raw_dists)
 
@@ -365,32 +415,52 @@ function grow_trees_mcp!(trees::Dict{String, GrowthTree}, domain;
         # only, advance per-tree stall counter, mark tree saturated when its
         # local stall reaches the threshold.
         per_tree_p95 = Float64[]
-        for (ti, name) in enumerate(branch_names)
-            tree_saturated[name] && (push!(per_tree_p95, tree_best_p95[name]); continue)
-            owned_dists = Float64[]
-            for i in 1:n_points
-                owner[i] == ti && push!(owned_dists, raw_dists[i])
-            end
-            tree_p95 = isempty(owned_dists) ? Inf : quantile(owned_dists, 0.95)
+        if n_trees == 1
+            name = branch_names[1]
+            tree_p95 = tree_saturated[name] ? tree_best_p95[name] : current_p95
             push!(per_tree_p95, tree_p95)
-            if tree_p95 < tree_best_p95[name] - 1e-6
-                tree_best_p95[name] = tree_p95
-                tree_stall[name] = 0
-            else
-                tree_stall[name] += 1
+            if !tree_saturated[name]
+                if tree_p95 < tree_best_p95[name] - 1e-6
+                    tree_best_p95[name] = tree_p95
+                    tree_stall[name] = 0
+                else
+                    tree_stall[name] += 1
+                end
+                if round_num > 10 && tree_stall[name] >= max_stall_rounds
+                    tree_saturated[name] = true
+                    println("[growth] $(name) saturated: p95 stalled at $(round(tree_best_p95[name]; digits=5)) cm after $(total_added[name]) branches")
+                    flush(stdout)
+                end
             end
-            if round_num > 10 && tree_stall[name] >= max_stall_rounds
-                tree_saturated[name] = true
-                println("[growth] $(name) saturated: p95 stalled at $(round(tree_best_p95[name]; digits=5)) cm after $(total_added[name]) branches")
-                flush(stdout)
+        else
+            for (ti, name) in enumerate(branch_names)
+                tree_saturated[name] && (push!(per_tree_p95, tree_best_p95[name]); continue)
+                owned_dists = Float64[]
+                for i in 1:n_points
+                    owner[i] == ti && push!(owned_dists, raw_dists[i])
+                end
+                tree_p95 = isempty(owned_dists) ? Inf : quantile(owned_dists, 0.95)
+                push!(per_tree_p95, tree_p95)
+                if tree_p95 < tree_best_p95[name] - 1e-6
+                    tree_best_p95[name] = tree_p95
+                    tree_stall[name] = 0
+                else
+                    tree_stall[name] += 1
+                end
+                if round_num > 10 && tree_stall[name] >= max_stall_rounds
+                    tree_saturated[name] = true
+                    println("[growth] $(name) saturated: p95 stalled at $(round(tree_best_p95[name]; digits=5)) cm after $(total_added[name]) branches")
+                    flush(stdout)
+                end
             end
         end
 
         if round_num <= 3 || round_num % 5 == 0
+            round_seconds = round(time() - round_started_at; digits=2)
             territory_counts = join(["$(branch_names[ti])=$(count(==(ti), owner))" for ti in 1:n_trees], " ")
             added_str = join(["$(name)=$(total_added[name])" for name in branch_names], " ")
             tree_p95_str = join(["$(branch_names[ti])=$(round(per_tree_p95[ti]; digits=4))" for ti in 1:n_trees], " ")
-            println("[growth] round=$(round_num) added=[$(added_str)] global_p95=$(round(current_p95; digits=5)) tree_p95=[$(tree_p95_str)] territory=[$(territory_counts)]")
+            println("[growth] round=$(round_num) seconds=$(round_seconds) added=[$(added_str)] global_p95=$(round(current_p95; digits=5)) tree_p95=[$(tree_p95_str)] territory=[$(territory_counts)]")
             flush(stdout)
         end
 

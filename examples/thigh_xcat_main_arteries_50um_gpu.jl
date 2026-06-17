@@ -10,7 +10,7 @@ run can produce tens of millions of segments. Generate downsampled viewers from
 the CSV after the run.
 
 Usage:
-    julia --project=. examples/thigh_xcat_main_arteries_50um_gpu.jl [terminal_um] [output_dir] [seed_csv] [raw_path] [organ_ids] [xcat_log] [target_branches_or_auto] [frontier_batch] [graph_block_size] [min_frontier_separation_cm] [max_segment_length_cm] [graph_neighbors] [max_path_nodes] [graph_jitter_cm] [snap_terminal_to_target] [max_terminal_snap_cm] [coverage_multiplier]
+    julia --project=. examples/thigh_xcat_main_arteries_50um_gpu.jl [terminal_um] [output_dir] [seed_csv] [raw_path] [organ_ids] [xcat_log] [target_branches_or_auto] [frontier_batch] [graph_block_size] [min_frontier_separation_cm] [max_segment_length_cm] [graph_neighbors] [max_path_nodes] [graph_jitter_cm] [snap_terminal_to_target] [max_terminal_snap_cm] [coverage_multiplier] [use_indexed_anchor] [use_astar_routing] [frontier_candidate_factor]
 """
 
 include(joinpath(@__DIR__, "thigh_xcat_femoral_100um.jl"))
@@ -33,6 +33,9 @@ const DEFAULT_50UM_GRAPH_JITTER_CM = 0.005
 const DEFAULT_50UM_SNAP_TERMINAL_TO_TARGET = true
 const DEFAULT_50UM_MAX_TERMINAL_SNAP_CM = 0.15
 const DEFAULT_50UM_COVERAGE_MULTIPLIER = 1.10
+const DEFAULT_50UM_USE_INDEXED_ANCHOR = true
+const DEFAULT_50UM_USE_ASTAR_ROUTING = true
+const DEFAULT_50UM_FRONTIER_CANDIDATE_FACTOR = 32
 
 function parse_bool_arg(value::AbstractString)
     text = lowercase(strip(String(value)))
@@ -82,6 +85,9 @@ function write_large_run_summary(path::AbstractString, raw_path, organ_ids_path,
                                  snap_terminal_to_target::Bool,
                                  max_terminal_snap_cm::Float64,
                                  coverage_multiplier::Float64,
+                                 use_indexed_anchor::Bool,
+                                 use_astar_routing::Bool,
+                                 frontier_candidate_factor::Int,
                                  started_at, finished_at)
     ext_cm = (mask_info.hi_cm .- mask_info.lo_cm) .+ domain.spacing_cm
     fixed_segments = count(tree.is_xcat)
@@ -118,6 +124,9 @@ function write_large_run_summary(path::AbstractString, raw_path, organ_ids_path,
         println(io, "- Graph jitter: $(round(graph_jitter_cm * 10; digits=3)) mm")
         println(io, "- Snap terminal to target: $(snap_terminal_to_target)")
         println(io, "- Maximum terminal snap: $(round(max_terminal_snap_cm * 10; digits=3)) mm")
+        println(io, "- Indexed anchor lookup: $(use_indexed_anchor)")
+        println(io, "- A* routing: $(use_astar_routing)")
+        println(io, "- Frontier candidate factor: $(frontier_candidate_factor)")
         println(io)
         println(io, "## XCAT Seed Geometry")
         println(io)
@@ -166,6 +175,9 @@ function main_50um_gpu()
     snap_terminal_to_target = length(ARGS) >= 15 ? parse_bool_arg(ARGS[15]) : DEFAULT_50UM_SNAP_TERMINAL_TO_TARGET
     max_terminal_snap_cm = length(ARGS) >= 16 ? parse(Float64, ARGS[16]) : DEFAULT_50UM_MAX_TERMINAL_SNAP_CM
     coverage_multiplier = length(ARGS) >= 17 ? parse(Float64, ARGS[17]) : DEFAULT_50UM_COVERAGE_MULTIPLIER
+    use_indexed_anchor = length(ARGS) >= 18 ? parse_bool_arg(ARGS[18]) : DEFAULT_50UM_USE_INDEXED_ANCHOR
+    use_astar_routing = length(ARGS) >= 19 ? parse_bool_arg(ARGS[19]) : DEFAULT_50UM_USE_ASTAR_ROUTING
+    frontier_candidate_factor = length(ARGS) >= 20 ? parse(Int, ARGS[20]) : DEFAULT_50UM_FRONTIER_CANDIDATE_FACTOR
     terminal_cm = terminal_um / 1e4
 
     mkpath(output_dir)
@@ -205,6 +217,9 @@ function main_50um_gpu()
     println("Maximum segment length: $(round(max_segment_length_cm * 10; digits=3)) mm")
     println("Snap terminal to target: $(snap_terminal_to_target)")
     println("Maximum terminal snap: $(round(max_terminal_snap_cm * 10; digits=3)) mm")
+    println("Indexed anchor lookup: $(use_indexed_anchor)")
+    println("A* routing: $(use_astar_routing)")
+    println("Frontier candidate factor: $(frontier_candidate_factor)")
     println("Cropped dims: $(size(mask)), foreground=$(count(mask))")
     println("[xcat seeds] surfaces=$(join([p.surface for p in ordered_seed_paths], ", "))")
     println("[xcat seeds] fixed_segments=$(length(tree.segment_start))")
@@ -236,6 +251,9 @@ function main_50um_gpu()
         graph_jitter_cm=graph_jitter_cm,
         snap_terminal_to_target=snap_terminal_to_target,
         max_terminal_snap_cm=max_terminal_snap_cm,
+        use_indexed_anchor=use_indexed_anchor,
+        use_astar_routing=use_astar_routing,
+        frontier_candidate_factor=frontier_candidate_factor,
         use_gpu=true)
 
     restore_xcat_seed_diameters!(tree, ordered_seed_paths)
@@ -263,6 +281,9 @@ function main_50um_gpu()
         snap_terminal_to_target=snap_terminal_to_target,
         max_terminal_snap_cm=max_terminal_snap_cm,
         coverage_multiplier=coverage_multiplier,
+        use_indexed_anchor=use_indexed_anchor,
+        use_astar_routing=use_astar_routing,
+        frontier_candidate_factor=frontier_candidate_factor,
         started_at=started_at,
         finished_at=Dates.now())
 

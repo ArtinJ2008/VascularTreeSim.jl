@@ -226,21 +226,20 @@ function VascularTreeSim._gpu_incremental_scan!(state::GPUDistanceState,
     nseg_total = length(seg_idx.ax)
     nseg_total == 0 && return nothing
 
-    # Upload only new segment endpoints for the incremental range
-    # But kernel needs absolute indices, so upload full arrays
-    d_ax = CuArray(seg_idx.ax)
-    d_ay = CuArray(seg_idx.ay)
-    d_az = CuArray(seg_idx.az)
-    d_bx = CuArray(seg_idx.bx)
-    d_by = CuArray(seg_idx.by)
-    d_bz = CuArray(seg_idx.bz)
+    d_ax = CuArray(@view seg_idx.ax[seg_start:seg_end])
+    d_ay = CuArray(@view seg_idx.ay[seg_start:seg_end])
+    d_az = CuArray(@view seg_idx.az[seg_start:seg_end])
+    d_bx = CuArray(@view seg_idx.bx[seg_start:seg_end])
+    d_by = CuArray(@view seg_idx.by[seg_start:seg_end])
+    d_bz = CuArray(@view seg_idx.bz[seg_start:seg_end])
+    nseg = length(d_ax)
 
     threads, blocks = _launch_config(state.n_points)
     @cuda threads=threads blocks=blocks _kernel_min_seg_dist_range!(
         state.d_min_dist, state.d_owner,
         state.d_px, state.d_py, state.d_pz,
         d_ax, d_ay, d_az, d_bx, d_by, d_bz,
-        Int32(seg_start), Int32(seg_end), Int32(tree_idx), 1.0 / weight)
+        Int32(1), Int32(nseg), Int32(tree_idx), 1.0 / weight)
     CUDA.synchronize()
 
     CUDA.unsafe_free!(d_ax); CUDA.unsafe_free!(d_ay); CUDA.unsafe_free!(d_az)

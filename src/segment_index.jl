@@ -169,6 +169,100 @@ Squared distance from point to segment s (inlined for speed).
     return dx*dx + dy*dy + dz*dz
 end
 
+@inline function _point_seg_projection_info(idx::SegmentSpatialIndex, s::Int,
+                                            px::Float64, py::Float64, pz::Float64)
+    abx = idx.bx[s] - idx.ax[s]
+    aby = idx.by[s] - idx.ay[s]
+    abz = idx.bz[s] - idx.az[s]
+    apx = px - idx.ax[s]
+    apy = py - idx.ay[s]
+    apz = pz - idx.az[s]
+    denom = abx*abx + aby*aby + abz*abz
+    t = denom <= 1e-24 ? 0.0 : clamp((apx*abx + apy*aby + apz*abz) / denom, 0.0, 1.0)
+    qx = idx.ax[s] + t * abx
+    qy = idx.ay[s] + t * aby
+    qz = idx.az[s] + t * abz
+    dx = px - qx
+    dy = py - qy
+    dz = pz - qz
+    return dx*dx + dy*dy + dz*dz, t, qx, qy, qz
+end
+
+function _indexed_nearest_segment_projection(idx::SegmentSpatialIndex,
+                                             point::SVector{3, Float64})
+    isempty(idx.ax) && return 0, 0.0, point, Inf
+    px, py, pz = point
+    cix, ciy, ciz = _seg_cell_idx(idx, px, py, pz)
+    best_d2 = Inf
+    best_seg = 0
+    best_t = 0.0
+    best_q = point
+    cs = idx.cell_size
+
+    for ring in 0:max(idx.dims[1], idx.dims[2], idx.dims[3])
+        ring_dist = (ring - 1) * cs
+        ring_dist * ring_dist > best_d2 && ring > 0 && break
+
+        for dz in -ring:ring
+            iz = ciz + dz
+            (iz < 1 || iz > idx.dims[3]) && continue
+            for dy in -ring:ring
+                iy = ciy + dy
+                (iy < 1 || iy > idx.dims[2]) && continue
+                for dx in -ring:ring
+                    max(abs(dx), abs(dy), abs(dz)) == ring || continue
+                    ix = cix + dx
+                    (ix < 1 || ix > idx.dims[1]) && continue
+
+                    cell = idx.cells[_seg_linear_idx(idx, ix, iy, iz)]
+                    for s in cell
+                        d2, t, qx, qy, qz = _point_seg_projection_info(idx, s, px, py, pz)
+                        if d2 < best_d2
+                            best_d2 = d2
+                            best_seg = s
+                            best_t = t
+                            best_q = SVector(qx, qy, qz)
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    best_seg == 0 && return 0, 0.0, point, Inf
+    return best_seg, best_t, best_q, sqrt(best_d2)
+end
+
+function _refresh_segment_index_segment!(idx::SegmentSpatialIndex, tree::GrowthTree, seg_id::Int)
+    (seg_id <= 0 || seg_id > length(idx.ax)) && return idx
+    a = tree.vertices[tree.segment_start[seg_id]]
+    b = tree.vertices[tree.segment_end[seg_id]]
+    idx.ax[seg_id] = a[1]; idx.ay[seg_id] = a[2]; idx.az[seg_id] = a[3]
+    idx.bx[seg_id] = b[1]; idx.by[seg_id] = b[2]; idx.bz[seg_id] = b[3]
+    return idx
+end
+
+function _choose_anchor_vertex_indexed!(tree::GrowthTree, idx::SegmentSpatialIndex,
+                                        point::SVector{3, Float64}; split_range=(0.2, 0.8))
+    seg_id, t, proj, _ = _indexed_nearest_segment_projection(idx, point)
+    if seg_id == 0
+        return tree.root_vertex, tree.vertices[tree.root_vertex]
+    end
+    if split_range[1] <= t <= split_range[2]
+        old_nseg = length(tree.segment_start)
+        mid = _split_segment!(tree, seg_id, proj)
+        _refresh_segment_index_segment!(idx, tree, seg_id)
+        old_nseg < length(tree.segment_start) && update_segment_index!(idx, tree, old_nseg + 1)
+        return mid, proj
+    end
+    start_v = tree.segment_start[seg_id]
+    end_v = tree.segment_end[seg_id]
+    ds = norm(point - tree.vertices[start_v])
+    de = norm(point - tree.vertices[end_v])
+    vid = ds <= de ? start_v : end_v
+    return vid, tree.vertices[vid]
+end
+
 """
     update_segment_index!(idx, tree, seg_start_idx) -> SegmentSpatialIndex
 
