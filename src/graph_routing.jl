@@ -1,5 +1,5 @@
 """
-    DomainGraph, Dijkstra shortest path, Catmull-Rom resampling, Laplacian smoothing.
+    DomainGraph, Dijkstra shortest path, Catmull-Rom resampling, Laplacian smoothing
 """
 
 struct DomainGraph
