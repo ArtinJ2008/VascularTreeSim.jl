@@ -218,24 +218,61 @@ function _densify_path(pts::Vector{SVector{3, Float64}}, max_seg_cm::Float64)
     return out
 end
 
-function _add_branch_path!(tree::GrowthTree, anchor_vertex::Int, path_points::Vector{SVector{3, Float64}}; gamma::Float64=3.0, max_branch_length_cm::Float64=Inf, max_segment_length_cm::Float64=0.1)
+function _anchor_touches_xcat(tree::GrowthTree, vertex::Int)
+    incoming = tree.incoming_segment[vertex]
+    incoming != 0 && tree.is_xcat[incoming] && return true
+    for child in tree.children[vertex]
+        seg = tree.incoming_segment[child]
+        seg != 0 && tree.is_xcat[seg] && return true
+    end
+    return false
+end
+
+function _add_branch_path!(tree::GrowthTree, anchor_vertex::Int, path_points::Vector{SVector{3, Float64}}; gamma::Float64=3.0, max_branch_length_cm::Float64=Inf, max_segment_length_cm::Float64=0.1, domain=nothing, max_anchor_gap_cm::Float64=-1.0)
     isempty(path_points) && return false
 
     # Murray budget check FIRST — refuse if any XCAT ancestor would over-allocate.
     _can_add_terminal_at_anchor(tree, anchor_vertex; gamma=gamma) || return false
 
+    anchor_point = tree.vertices[anchor_vertex]
     local_pts = copy(path_points)
-    if norm(local_pts[1] - tree.vertices[anchor_vertex]) < 1e-8
+    if norm(local_pts[1] - anchor_point) < 1e-8
         local_pts = local_pts[2:end]
     end
     isempty(local_pts) && return false
 
-    total_len = _path_total_length(vcat([tree.vertices[anchor_vertex]], local_pts))
+    total_len = _path_total_length(vcat([anchor_point], local_pts))
     if isfinite(max_branch_length_cm) && total_len > max_branch_length_cm
         return false
     end
 
-    local_pts = _densify_path(local_pts, max_segment_length_cm)
+    effective_anchor_gap_cm = max_anchor_gap_cm < 0.0 ? max(4.0 * max_segment_length_cm, 0.25) : max_anchor_gap_cm
+    anchor_gap_cm = norm(local_pts[1] - anchor_point)
+    if domain !== nothing && _anchor_touches_xcat(tree, anchor_vertex)
+        # The anatomical XCAT seed can be a voxelized vessel centerline adjacent
+        # to the route mask. Allow only a local entry from that seed into the
+        # route; long seed-to-route bridges are rejected here.
+        anchor_gap_cm <= effective_anchor_gap_cm || return false
+        full_path = _densify_path(vcat([anchor_point], local_pts), max_segment_length_cm)
+        if _path_edges_stay_in_domain(domain, full_path)
+            local_pts = full_path[2:end]
+        else
+            local_pts = _densify_path(local_pts, max_segment_length_cm)
+            _path_edges_stay_in_domain(domain, local_pts) || return false
+        end
+    elseif domain === nothing || _point_in_domain(domain, anchor_point)
+        full_path = _densify_path(vcat([anchor_point], local_pts), max_segment_length_cm)
+        domain !== nothing && !_path_edges_stay_in_domain(domain, full_path) && return false
+        local_pts = full_path[2:end]
+    else
+        # Non-XCAT anchors should normally already lie in the route mask. If a
+        # boundary anchor is fractionally outside due to voxelization, permit
+        # only a short local entry and keep the routed part inside the domain.
+        anchor_gap_cm <= effective_anchor_gap_cm || return false
+        _point_in_domain(domain, local_pts[1]) || return false
+        local_pts = _densify_path(local_pts, max_segment_length_cm)
+        _path_edges_stay_in_domain(domain, local_pts) || return false
+    end
 
     d_term = tree.terminal_diameter_cm
     prev = anchor_vertex

@@ -82,6 +82,145 @@ function write_right_leg_mask_artifacts(output_dir::AbstractString, mask::BitArr
     return nhdr_path, raw_path
 end
 
+function build_right_leg_route_tissue_mask(raw_labels, dims, keep_x, crop_lo::Tuple, crop_hi::Tuple)
+    keep = Set(keep_x)
+    nx, ny, _ = dims
+    sx = crop_hi[1] - crop_lo[1] + 1
+    sy = crop_hi[2] - crop_lo[2] + 1
+    sz = crop_hi[3] - crop_lo[3] + 1
+    mask = falses(sx, sy, sz)
+    for z in crop_lo[3]:crop_hi[3], y in crop_lo[2]:crop_hi[2], x in crop_lo[1]:crop_hi[1]
+        x in keep || continue
+        idx0 = (x - 1) + nx * ((y - 1) + ny * (z - 1))
+        raw_labels[idx0 + 1] == 0 && continue
+        mask[x - crop_lo[1] + 1, y - crop_lo[2] + 1, z - crop_lo[3] + 1] = true
+    end
+    count(mask) > 0 || error("Right-leg route tissue mask is empty")
+    return mask
+end
+
+function _dilate_axis(mask::BitArray{3}, radius::Int, axis::Int)
+    radius <= 0 && return copy(mask)
+    nx, ny, nz = size(mask)
+    out = falses(nx, ny, nz)
+    if axis == 1
+        for k in 1:nz, j in 1:ny
+            count = 0
+            hi0 = min(nx, radius + 1)
+            for i in 1:hi0
+                count += mask[i, j, k] ? 1 : 0
+            end
+            for i in 1:nx
+                out[i, j, k] = count > 0
+                old_i = i - radius
+                new_i = i + radius + 1
+                old_i >= 1 && (count -= mask[old_i, j, k] ? 1 : 0)
+                new_i <= nx && (count += mask[new_i, j, k] ? 1 : 0)
+            end
+        end
+    elseif axis == 2
+        for k in 1:nz, i in 1:nx
+            count = 0
+            hi0 = min(ny, radius + 1)
+            for j in 1:hi0
+                count += mask[i, j, k] ? 1 : 0
+            end
+            for j in 1:ny
+                out[i, j, k] = count > 0
+                old_j = j - radius
+                new_j = j + radius + 1
+                old_j >= 1 && (count -= mask[i, old_j, k] ? 1 : 0)
+                new_j <= ny && (count += mask[i, new_j, k] ? 1 : 0)
+            end
+        end
+    elseif axis == 3
+        for j in 1:ny, i in 1:nx
+            count = 0
+            hi0 = min(nz, radius + 1)
+            for k in 1:hi0
+                count += mask[i, j, k] ? 1 : 0
+            end
+            for k in 1:nz
+                out[i, j, k] = count > 0
+                old_k = k - radius
+                new_k = k + radius + 1
+                old_k >= 1 && (count -= mask[i, j, old_k] ? 1 : 0)
+                new_k <= nz && (count += mask[i, j, new_k] ? 1 : 0)
+            end
+        end
+    else
+        error("axis must be 1, 2, or 3")
+    end
+    return out
+end
+
+function dilate_mask_box(mask::BitArray{3}, radius::Int)
+    radius <= 0 && return copy(mask)
+    return _dilate_axis(_dilate_axis(_dilate_axis(mask, radius, 1), radius, 2), radius, 3)
+end
+
+function fill_axial_slice_spans(mask::BitArray{3})
+    nx, ny, nz = size(mask)
+    out = copy(mask)
+    for k in 1:nz
+        for j in 1:ny
+            lo = 0
+            hi = 0
+            for i in 1:nx
+                if mask[i, j, k]
+                    lo == 0 && (lo = i)
+                    hi = i
+                end
+            end
+            if lo > 0
+                for i in lo:hi
+                    out[i, j, k] = true
+                end
+            end
+        end
+        for i in 1:nx
+            lo = 0
+            hi = 0
+            for j in 1:ny
+                if mask[i, j, k]
+                    lo == 0 && (lo = j)
+                    hi = j
+                end
+            end
+            if lo > 0
+                for j in lo:hi
+                    out[i, j, k] = true
+                end
+            end
+        end
+    end
+    return out
+end
+
+function write_right_leg_route_mask_artifacts(output_dir::AbstractString, mask::BitArray{3},
+                                             origin_cm::SVector{3, Float64}, spacing_cm::SVector{3, Float64})
+    raw_path = joinpath(output_dir, "right_leg_route_tissue_mask.raw")
+    nhdr_path = joinpath(output_dir, "right_leg_route_tissue_mask.nhdr")
+    open(raw_path, "w") do io
+        for k in axes(mask, 3), j in axes(mask, 2), i in axes(mask, 1)
+            write(io, UInt8(mask[i, j, k] ? 1 : 0))
+        end
+    end
+    open(nhdr_path, "w") do io
+        println(io, "NRRD0005")
+        println(io, "type: uchar")
+        println(io, "dimension: 3")
+        println(io, "space: left-posterior-superior")
+        println(io, "sizes: $(size(mask, 1)) $(size(mask, 2)) $(size(mask, 3))")
+        println(io, "space directions: ($(spacing_cm[1] * 10),0,0) (0,$(spacing_cm[2] * 10),0) (0,0,$(spacing_cm[3] * 10))")
+        println(io, "space origin: ($(origin_cm[1] * 10),$(origin_cm[2] * 10),$(origin_cm[3] * 10))")
+        println(io, "encoding: raw")
+        println(io, "endian: little")
+        println(io, "data file: right_leg_route_tissue_mask.raw")
+    end
+    return nhdr_path, raw_path
+end
+
 function select_existing_path(paths::Vararg{AbstractString})
     for path in paths
         isfile(path) && return path
@@ -160,6 +299,21 @@ end
 
 function path_length_cm(path::XCATSeedPath)
     return sum(norm(path.points[i] - path.points[i - 1]) for i in 2:length(path.points))
+end
+
+function orient_right_leg_root_path(path::XCATSeedPath)
+    length(path.points) >= 2 || return path
+    first_z = first(path.points)[3]
+    last_z = last(path.points)[3]
+    if last_z > first_z
+        return XCATSeedPath(path.surface, reverse(path.point_indices), reverse(path.points), reverse(path.diameters_cm))
+    end
+    return path
+end
+
+function proximal_root_diameter_cm(path::XCATSeedPath; window_points::Int=8)
+    n = min(max(window_points, 1), length(path.diameters_cm))
+    return maximum(path.diameters_cm[1:n])
 end
 
 function select_main_paths(paths::Vector{XCATSeedPath}; max_paths::Int=6, min_length_cm::Float64=5.0)
@@ -350,7 +504,7 @@ function write_xcat_paths_csv(path::AbstractString, paths::Vector{XCATSeedPath})
     return path
 end
 
-function make_single_raw_seed_tree(path::XCATSeedPath; terminal_diameter_cm::Float64)
+function make_single_raw_seed_tree(path::XCATSeedPath; terminal_diameter_cm::Float64, root_diameter_cm::Union{Nothing, Float64}=nothing)
     length(path.points) >= 2 || error("Cannot build seed tree from fewer than two points: $(path.surface)")
     vertices = copy(path.points)
     parent_vertex = [idx == 1 ? 0 : idx - 1 for idx in eachindex(vertices)]
@@ -386,7 +540,7 @@ function make_single_raw_seed_tree(path::XCATSeedPath; terminal_diameter_cm::Flo
         subtree_terminal_count,
         terminal_diameter_cm,
         1,
-        maximum(segment_diameter_cm),
+        root_diameter_cm === nothing ? maximum(segment_diameter_cm) : root_diameter_cm,
     )
 end
 
@@ -456,7 +610,7 @@ function coverage_stats_for_tree(tree::GrowthTree, points::Matrix{Float64})
 end
 
 function artery_weight(path::XCATSeedPath)
-    return max(maximum(path.diameters_cm), 1e-6)^3
+    return max(proximal_root_diameter_cm(path), 1e-6)^3
 end
 
 function append_disconnected_overlay_path!(tree::GrowthTree, path::XCATSeedPath)

@@ -13,6 +13,31 @@ struct GraphSpatialGrid
     grid::PointCloudGrid
 end
 
+function graph_connected_components(graph::DomainGraph)
+    n = length(graph.points)
+    component = zeros(Int, n)
+    comp_count = 0
+    queue = Vector{Int}()
+    for start in 1:n
+        component[start] != 0 && continue
+        comp_count += 1
+        empty!(queue)
+        push!(queue, start)
+        component[start] = comp_count
+        head = 1
+        while head <= length(queue)
+            u = queue[head]
+            head += 1
+            for v in graph.neighbors[u]
+                component[v] == 0 || continue
+                component[v] = comp_count
+                push!(queue, v)
+            end
+        end
+    end
+    return component, comp_count
+end
+
 mutable struct RouteWorkspace
     dist::Vector{Float64}
     prev::Vector{Int}
@@ -73,6 +98,28 @@ end
 
 # ── Graph construction ──
 
+function _edge_stays_in_domain(domain, a::SVector{3, Float64}, b::SVector{3, Float64})
+    _point_in_domain(domain, a) || return false
+    _point_in_domain(domain, b) || return false
+    dist = norm(b - a)
+    step = max(minimum(domain.spacing_cm) / 2, 1e-6)
+    n = max(1, ceil(Int, dist / step))
+    for i in 1:(n - 1)
+        t = i / n
+        p = (1.0 - t) .* a .+ t .* b
+        _point_in_domain(domain, p) || return false
+    end
+    return true
+end
+
+function _path_edges_stay_in_domain(domain, points::Vector{SVector{3, Float64}})
+    length(points) <= 1 && return true
+    for i in 2:length(points)
+        _edge_stays_in_domain(domain, points[i - 1], points[i]) || return false
+    end
+    return true
+end
+
 function build_domain_graph(points_cm::Matrix{Float64}, domain; k::Int=10)
     pts = [SVector(points_cm[i, 1], points_cm[i, 2], points_cm[i, 3]) for i in axes(points_cm, 1)]
     point_matrix = Matrix{Float64}(undef, length(pts), 3)
@@ -101,6 +148,7 @@ function build_domain_graph(points_cm::Matrix{Float64}, domain; k::Int=10)
         local_neighbors = Int[]
         local_costs = Float64[]
         for (d, j) in _sample_k_nearest_grid(pts, grid, i, k)
+            _edge_stays_in_domain(domain, pts[i], pts[j]) || continue
             mid = 0.5 .* (pts[i] + pts[j])
             base_cost = d * shell_midwall_cost(domain, (mid[1], mid[2], mid[3]))
             push!(local_neighbors, j)
@@ -108,6 +156,13 @@ function build_domain_graph(points_cm::Matrix{Float64}, domain; k::Int=10)
         end
         neighbors[i] = local_neighbors
         costs[i] = local_costs
+    end
+    for i in 1:n
+        for idx in eachindex(neighbors[i])
+            j = neighbors[i][idx]
+            push!(neighbors[j], i)
+            push!(costs[j], costs[i][idx])
+        end
     end
     return DomainGraph(pts, neighbors, costs)
 end
@@ -245,9 +300,7 @@ function _shortest_path(graph::DomainGraph, source::Int, target::Int;
             end
         end
     end
-    if prev[target] == 0
-        return [source, target]
-    end
+    prev[target] == 0 && return Int[]
     path = Int[]
     u = target
     while u != 0
@@ -302,7 +355,7 @@ function _shortest_path_astar!(workspace::RouteWorkspace, graph::DomainGraph,
         end
     end
 
-    workspace.seen[target] == stamp || return [source, target]
+    workspace.seen[target] == stamp || return Int[]
     path = Int[]
     u = target
     while u != 0
@@ -382,18 +435,21 @@ end
 function _prepare_branch_path(points::Vector{SVector{3, Float64}}, domain;
                               max_nodes::Int=12, smooth_passes::Int=4, spline_density::Int=4)
     pts = _dedupe_path(points)
+    length(pts) <= 1 && return pts
+    _path_edges_stay_in_domain(domain, pts) || return SVector{3, Float64}[]
     length(pts) <= 2 && return pts
     waypoints = _subsample_path(pts; max_nodes=max(max_nodes, 6))
     waypoints = _dedupe_path(waypoints)
+    _path_edges_stay_in_domain(domain, waypoints) || (waypoints = pts)
     length(waypoints) <= 2 && return waypoints
     dense = _catmull_rom_resample(waypoints; segments_per_span=spline_density)
-    dense = filter(p -> _point_in_domain(domain, p), dense)
-    if length(dense) < 2
-        return _dedupe_path(waypoints)
-    end
+    dense = _dedupe_path(dense)
+    _path_edges_stay_in_domain(domain, dense) || (dense = waypoints)
     dense = _smooth_path_in_domain(dense, domain; passes=smooth_passes)
-    dense = _subsample_path(dense; max_nodes=max_nodes)
-    return _dedupe_path(dense)
+    dense = _dedupe_path(dense)
+    _path_edges_stay_in_domain(domain, dense) || (dense = waypoints)
+    candidate = _dedupe_path(_subsample_path(dense; max_nodes=max_nodes))
+    return _path_edges_stay_in_domain(domain, candidate) ? candidate : dense
 end
 
 function _jitter_points_in_domain(points::Matrix{Float64}, domain; max_jitter_cm::Float64=0.0, max_tries::Int=6)

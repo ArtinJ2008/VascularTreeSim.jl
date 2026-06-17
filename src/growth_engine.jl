@@ -86,7 +86,8 @@ function _choose_competitive_frontiers(global_min_dist::Vector{Float64}, owner::
     # points here have owner == tree_idx, multiply by `weight` to recover raw.
     # Supply-radius comparison is in raw cm.
     scored = Tuple{Float64, Int}[]
-    candidate_limit = candidate_factor > 0 ? max(max_targets * candidate_factor, max_targets) : 0
+    return_limit = candidate_factor > 0 ? max(max_targets * candidate_factor, max_targets) : max_targets
+    candidate_limit = candidate_factor > 0 ? return_limit : 0
     for i in eachindex(global_min_dist)
         owner[i] == tree_idx || continue
         d_raw = global_min_dist[i] * weight
@@ -126,10 +127,84 @@ function _choose_competitive_frontiers(global_min_dist::Vector{Float64}, owner::
         end
         if ok
             push!(chosen, idx)
-            length(chosen) >= max_targets && break
+            length(chosen) >= return_limit && break
         end
     end
     return chosen
+end
+
+function _coverage_graph_components(points_cm::Matrix{Float64}, sgrid::GraphSpatialGrid,
+                                    graph_component::Vector{Int})
+    point_component = Vector{Int}(undef, size(points_cm, 1))
+    Threads.@threads for i in axes(points_cm, 1)
+        p = SVector(points_cm[i, 1], points_cm[i, 2], points_cm[i, 3])
+        graph_idx, _ = _nearest_graph_index(sgrid, p)
+        point_component[i] = graph_component[graph_idx]
+    end
+    return point_component
+end
+
+function _tree_graph_components(tree::GrowthTree, sgrid::GraphSpatialGrid,
+                                graph_component::Vector{Int}, max_seed_gap_cm::Float64)
+    comps = Set{Int}()
+    best_idx = 1
+    best_dist = Inf
+    for p in tree.vertices
+        graph_idx, dist = _nearest_graph_index(sgrid, p)
+        if dist < best_dist
+            best_dist = dist
+            best_idx = graph_idx
+        end
+        dist <= max_seed_gap_cm && push!(comps, graph_component[graph_idx])
+    end
+    if isempty(comps)
+        push!(comps, graph_component[best_idx])
+    end
+    return comps
+end
+
+function _enforce_component_reachability!(global_min_dist::Vector{Float64}, owner::Vector{Int},
+                                          points_cm::Matrix{Float64}, point_components::Vector{Int},
+                                          tree_components::Vector{Set{Int}},
+                                          seg_indices::Dict{String, SegmentSpatialIndex},
+                                          branch_names::Vector{String},
+                                          territory_w_arr::Vector{Float64})
+    corrected = 0
+    unclaimed = 0
+    n_trees = length(branch_names)
+    @inbounds for i in eachindex(owner)
+        current = owner[i]
+        comp = point_components[i]
+        if current > 0 && comp in tree_components[current]
+            continue
+        end
+
+        best_eff = Inf
+        best_owner = 0
+        x = points_cm[i, 1]
+        y = points_cm[i, 2]
+        z = points_cm[i, 3]
+        for ti in 1:n_trees
+            comp in tree_components[ti] || continue
+            d = _indexed_segment_distance(seg_indices[branch_names[ti]], x, y, z)
+            d_eff = d / territory_w_arr[ti]
+            if d_eff < best_eff
+                best_eff = d_eff
+                best_owner = ti
+            end
+        end
+
+        if best_owner == 0
+            global_min_dist[i] = Inf
+            owner[i] = 0
+            unclaimed += 1
+        else
+            global_min_dist[i] = best_eff
+            owner[i] = best_owner
+            corrected += 1
+        end
+    end
+    return corrected, unclaimed
 end
 
 function _segment_stays_in_domain(domain::VoxelShellDomain,
@@ -153,7 +228,7 @@ end
 function grow_trees_mcp!(trees::Dict{String, GrowthTree}, domain;
         effective_supply_radius_cm::Float64=1.25e-3,
         capillary_diameter_cm::Float64=8e-4,
-        max_new_branches_per_tree::Int=120,
+        max_new_branches_per_tree::Union{Int, Dict{String, Int}}=120,
         graph_neighbors::Int=10,
         gamma::Float64=3.0,
         min_frontier_separation_cm::Float64=0.12,
@@ -171,9 +246,11 @@ function grow_trees_mcp!(trees::Dict{String, GrowthTree}, domain;
         graph_jitter_cm::Float64=-1.0,
         snap_terminal_to_target::Bool=false,
         max_terminal_snap_cm::Float64=Inf,
+        max_anchor_gap_cm::Float64=-1.0,
         use_indexed_anchor::Bool=false,
         use_astar_routing::Bool=false,
         frontier_candidate_factor::Int=0,
+        component_reachability::Bool=false,
         tree_weights::Union{Nothing, Dict{String, Float64}}=nothing,
         territory_weights::Union{Nothing, Dict{String, Float64}}=nothing)
 
@@ -197,6 +274,13 @@ function grow_trees_mcp!(trees::Dict{String, GrowthTree}, domain;
     branch_names = sort(collect(keys(trees)))
     n_trees = length(branch_names)
     n_points = size(points_cm, 1)
+    branch_caps = Dict{String, Int}()
+    for name in branch_names
+        cap = max_new_branches_per_tree isa Dict ?
+            get(max_new_branches_per_tree, name, 0) :
+            max_new_branches_per_tree
+        branch_caps[name] = max(0, cap)
+    end
 
     # Normalize per-tree growth weights. Each tree's per-round batch is
     # scaled by its normalized weight so that the total number of frontiers
@@ -250,6 +334,30 @@ function grow_trees_mcp!(trees::Dict{String, GrowthTree}, domain;
         seg_indices[name] = build_segment_index(trees[name])
     end
 
+    point_components = Int[]
+    tree_components = Set{Int}[]
+    if component_reachability
+        t_comp = time()
+        graph_component, graph_component_count = graph_connected_components(graph)
+        if graph_component_count <= 1
+            component_reachability = false
+            println("[growth] graph components=1 reachability filter not needed ($(round(time()-t_comp; digits=2))s)")
+        else
+            point_components = _coverage_graph_components(points_cm, sgrid, graph_component)
+            effective_seed_gap_cm = max_anchor_gap_cm < 0.0 ? max(4.0 * max_segment_length_cm, 0.25) : max_anchor_gap_cm
+            tree_components = [
+                _tree_graph_components(trees[name], sgrid, graph_component, effective_seed_gap_cm)
+                for name in branch_names
+            ]
+            comp_summary = join([
+                "$(branch_names[i])=$(length(tree_components[i]))"
+                for i in eachindex(branch_names)
+            ], " ")
+            println("[growth] graph components=$(graph_component_count) reachability=$(round(time()-t_comp; digits=2))s tree_components=[$(comp_summary)]")
+        end
+        flush(stdout)
+    end
+
     # ── Initialize global min distances ──
     t_init = time()
     gpu_state = nothing
@@ -291,6 +399,14 @@ function grow_trees_mcp!(trees::Dict{String, GrowthTree}, domain;
         end
     end
 
+    if component_reachability
+        corrected, unclaimed = _enforce_component_reachability!(
+            global_min_dist, owner, points_cm, point_components, tree_components,
+            seg_indices, branch_names, territory_w_arr)
+        println("[growth] component reachability corrected initial owners=$(corrected) unclaimed=$(unclaimed)")
+        flush(stdout)
+    end
+
     # Helper: raw distance at point i (undoing the effective-distance storage).
     # Points with owner=0 (unclaimed — shouldn't happen after init) use raw=Inf.
     raw_dist_at(i) = owner[i] > 0 ? global_min_dist[i] * territory_w_arr[owner[i]] : Inf
@@ -329,9 +445,9 @@ function grow_trees_mcp!(trees::Dict{String, GrowthTree}, domain;
 
         for (ti, name) in enumerate(branch_names)
             tree_saturated[name] && continue
-            total_added[name] >= max_new_branches_per_tree && continue
+            total_added[name] >= branch_caps[name] && continue
             tree = trees[name]
-            remaining = max_new_branches_per_tree - total_added[name]
+            remaining = branch_caps[name] - total_added[name]
             batch = min(tree_to_batch[name], remaining)
 
             w_ti = territory_w_arr[ti]
@@ -345,6 +461,9 @@ function grow_trees_mcp!(trees::Dict{String, GrowthTree}, domain;
 
             seg_before = length(tree.segment_start)
             local_added = 0
+            route_empty = 0
+            prepared_empty = 0
+            add_rejected = 0
             for idx in frontiers
                 # global_min_dist is effective; compare raw against supply radius
                 (global_min_dist[idx] * w_ti) <= effective_supply_radius_cm && continue
@@ -360,8 +479,16 @@ function grow_trees_mcp!(trees::Dict{String, GrowthTree}, domain;
                 path_ids = use_astar_routing ?
                     _shortest_path_astar!(route_workspace, graph, source_idx, target_idx; turn_penalty=turn_penalty) :
                     _shortest_path(graph, source_idx, target_idx; turn_penalty=turn_penalty)
+                if isempty(path_ids)
+                    route_empty += 1
+                    continue
+                end
                 path_points = _prepare_branch_path([graph.points[i] for i in path_ids], domain;
                     max_nodes=max_path_nodes, smooth_passes=smooth_passes, spline_density=spline_density)
+                if isempty(path_points)
+                    prepared_empty += 1
+                    continue
+                end
                 if snap_terminal_to_target && !isempty(path_points)
                     snap_distance = norm(p - path_points[end])
                     if snap_distance > 1e-8 &&
@@ -372,17 +499,25 @@ function grow_trees_mcp!(trees::Dict{String, GrowthTree}, domain;
                 end
                 if _add_branch_path!(tree, anchor_vertex, path_points;
                         gamma=gamma,
-                        max_branch_length_cm=Inf, max_segment_length_cm=max_segment_length_cm)
+                        max_branch_length_cm=Inf, max_segment_length_cm=max_segment_length_cm,
+                        domain=domain, max_anchor_gap_cm=max_anchor_gap_cm)
                     if use_indexed_anchor && length(tree.segment_start) > path_seg_before
                         seg_indices[name] = update_segment_index!(seg_indices[name], tree, path_seg_before + 1)
                     end
                     total_added[name] += 1
                     local_added += 1
                     round_progress = true
-                    total_added[name] >= max_new_branches_per_tree && break
+                    local_added >= batch && break
+                    total_added[name] >= branch_caps[name] && break
                 elseif use_indexed_anchor && length(tree.segment_start) > path_seg_before
                     seg_indices[name] = update_segment_index!(seg_indices[name], tree, path_seg_before + 1)
+                else
+                    add_rejected += 1
                 end
+            end
+            if local_added == 0
+                println("[growth-debug] $(name) round=$(round_num) frontiers=$(length(frontiers)) route_empty=$(route_empty) prepared_empty=$(prepared_empty) add_rejected=$(add_rejected)")
+                flush(stdout)
             end
 
             # Incremental distance update
@@ -399,6 +534,11 @@ function grow_trees_mcp!(trees::Dict{String, GrowthTree}, domain;
                     # CPU incremental: threaded scan of new segments
                     _update_global_min_distances_incremental!(global_min_dist, owner, points_cm,
                         seg_indices[name], ti, seg_before + 1, seg_after; weight=w_ti)
+                end
+                if component_reachability
+                    _enforce_component_reachability!(
+                        global_min_dist, owner, points_cm, point_components, tree_components,
+                        seg_indices, branch_names, territory_w_arr)
                 end
             end
         end
@@ -465,7 +605,7 @@ function grow_trees_mcp!(trees::Dict{String, GrowthTree}, domain;
         end
 
         # Stopping criteria
-        all_maxed = all(total_added[name] >= max_new_branches_per_tree for name in branch_names)
+        all_maxed = all(total_added[name] >= branch_caps[name] for name in branch_names)
         p95_ok = isfinite(target_p95_distance_cm) && current_p95 <= target_p95_distance_cm
         max_ok = isfinite(target_max_distance_cm) && current_max <= target_max_distance_cm
         all_saturated = all(values(tree_saturated))
@@ -507,6 +647,13 @@ function grow_trees_mcp!(trees::Dict{String, GrowthTree}, domain;
     end
 
     stats = Dict{String, NamedTuple}()
+    stats["__global__"] = (
+        terminals=sum(length(_branch_terminals(trees[name])) for name in branch_names),
+        p50=quantile(raw_dists, 0.50),
+        p95=quantile(raw_dists, 0.95),
+        max=maximum(raw_dists),
+        added=sum(values(total_added)),
+    )
     for (ti, name) in enumerate(branch_names)
         idxs = territories[name]
         dists = Vector{Float64}(undef, length(idxs))
