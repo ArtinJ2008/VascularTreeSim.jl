@@ -36,7 +36,55 @@ function right_leg_muscle_labels(name_to_labels)
     return labels
 end
 
-function build_right_leg_muscle_mask(raw_labels, dims, target_labels::Vector{UInt16}, keep_x)
+function right_leg_soft_target_labels(name_to_labels)
+    labels = UInt16[]
+    for (name, labs) in name_to_labels
+        lname = lowercase(String(name))
+        is_right_leg_envelope = lname == "leg_right" || startswith(lname, "foot_right")
+        is_muscle = startswith(lname, "musc") || lname == "rfoot_musc"
+        is_fat_or_skin = occursin("fat", lname) || occursin("adip", lname) ||
+            occursin("skin", lname) || occursin("subcut", lname)
+        if is_right_leg_envelope || is_muscle || is_fat_or_skin
+            append!(labels, labs)
+        end
+    end
+    unique!(labels)
+    !isempty(labels) || error("No right-leg soft-tissue target labels found in organ ID file")
+    return labels
+end
+
+function right_leg_route_tissue_labels(name_to_labels)
+    labels = UInt16[]
+    for (name, labs) in name_to_labels
+        lname = lowercase(String(name))
+        is_right_leg_envelope = lname == "leg_right" || startswith(lname, "foot_right")
+        is_muscle = startswith(lname, "musc") || lname == "rfoot_musc"
+        is_xcat_vessel = lname == "arteries_rleg" || lname == "veins_rleg"
+        is_fat_or_skin = occursin("fat", lname) || occursin("adip", lname) ||
+            occursin("skin", lname) || occursin("subcut", lname)
+        if is_right_leg_envelope || is_muscle || is_xcat_vessel || is_fat_or_skin
+            append!(labels, labs)
+        end
+    end
+    unique!(labels)
+    !isempty(labels) || error("No right-leg soft-tissue route labels found in organ ID file")
+    return labels
+end
+
+function vessel_aware_crop_pad_voxels(spacing_cm;
+                                      max_vessel_distance_cm::Float64=MAX_FIXED_VESSEL_DISTANCE_TO_MUSCLE_CM,
+                                      vessel_radius_voxels::Int=1,
+                                      margin_voxels::Int=2)
+    max_vessel_distance_cm < 0 && error("max_vessel_distance_cm must be >= 0")
+    vessel_radius_voxels < 0 && error("vessel_radius_voxels must be >= 0")
+    margin_voxels < 0 && error("margin_voxels must be >= 0")
+    spacing_min = minimum(spacing_cm)
+    spacing_min > 0 || error("spacing must be positive")
+    return max(2, ceil(Int, max_vessel_distance_cm / spacing_min) + vessel_radius_voxels + margin_voxels)
+end
+
+function build_right_leg_label_mask(raw_labels, dims, target_labels::Vector{UInt16}, keep_x;
+                                    description::AbstractString="Right-leg label")
     target_set = Set(target_labels)
     keep = Set(keep_x)
     nx, ny, nz = dims
@@ -54,14 +102,27 @@ function build_right_leg_muscle_mask(raw_labels, dims, target_labels::Vector{UIn
         kept_counts[lab] = get(kept_counts, lab, 0) + 1
     end
 
-    count(mask) > 0 || error("Right-leg muscle mask is empty")
+    count(mask) > 0 || error("$(description) mask is empty")
     return mask, kept_counts
 end
 
-function write_right_leg_mask_artifacts(output_dir::AbstractString, mask::BitArray{3},
-                                        origin_cm::SVector{3, Float64}, spacing_cm::SVector{3, Float64})
-    raw_path = joinpath(output_dir, "right_leg_muscle_mask.raw")
-    nhdr_path = joinpath(output_dir, "right_leg_muscle_mask.nhdr")
+function build_right_leg_muscle_mask(raw_labels, dims, target_labels::Vector{UInt16}, keep_x)
+    return build_right_leg_label_mask(raw_labels, dims, target_labels, keep_x;
+        description="Right-leg muscle")
+end
+
+function crop_mask_to_bounds(full_mask::BitArray{3}, crop_lo::Tuple, crop_hi::Tuple)
+    return full_mask[crop_lo[1]:crop_hi[1], crop_lo[2]:crop_hi[2], crop_lo[3]:crop_hi[3]]
+end
+
+function write_right_leg_binary_mask_artifacts(output_dir::AbstractString, mask::BitArray{3},
+                                               origin_cm::SVector{3, Float64},
+                                               spacing_cm::SVector{3, Float64};
+                                               basename::AbstractString)
+    raw_filename = "$(basename).raw"
+    nhdr_filename = "$(basename).nhdr"
+    raw_path = joinpath(output_dir, raw_filename)
+    nhdr_path = joinpath(output_dir, nhdr_filename)
     open(raw_path, "w") do io
         for k in axes(mask, 3), j in axes(mask, 2), i in axes(mask, 1)
             write(io, UInt8(mask[i, j, k] ? 1 : 0))
@@ -77,12 +138,26 @@ function write_right_leg_mask_artifacts(output_dir::AbstractString, mask::BitArr
         println(io, "space origin: ($(origin_cm[1] * 10),$(origin_cm[2] * 10),$(origin_cm[3] * 10))")
         println(io, "encoding: raw")
         println(io, "endian: little")
-        println(io, "data file: right_leg_muscle_mask.raw")
+        println(io, "data file: $(raw_filename)")
     end
     return nhdr_path, raw_path
 end
 
-function build_right_leg_route_tissue_mask(raw_labels, dims, keep_x, crop_lo::Tuple, crop_hi::Tuple)
+function write_right_leg_mask_artifacts(output_dir::AbstractString, mask::BitArray{3},
+                                        origin_cm::SVector{3, Float64}, spacing_cm::SVector{3, Float64})
+    return write_right_leg_binary_mask_artifacts(output_dir, mask, origin_cm, spacing_cm;
+        basename="right_leg_muscle_mask")
+end
+
+function write_right_leg_target_mask_artifacts(output_dir::AbstractString, mask::BitArray{3},
+                                               origin_cm::SVector{3, Float64}, spacing_cm::SVector{3, Float64})
+    return write_right_leg_binary_mask_artifacts(output_dir, mask, origin_cm, spacing_cm;
+        basename="right_leg_target_tissue_mask")
+end
+
+function build_right_leg_route_tissue_mask(raw_labels, dims, route_labels::Vector{UInt16},
+                                           keep_x, crop_lo::Tuple, crop_hi::Tuple)
+    route_set = Set(route_labels)
     keep = Set(keep_x)
     nx, ny, _ = dims
     sx = crop_hi[1] - crop_lo[1] + 1
@@ -92,7 +167,7 @@ function build_right_leg_route_tissue_mask(raw_labels, dims, keep_x, crop_lo::Tu
     for z in crop_lo[3]:crop_hi[3], y in crop_lo[2]:crop_hi[2], x in crop_lo[1]:crop_hi[1]
         x in keep || continue
         idx0 = (x - 1) + nx * ((y - 1) + ny * (z - 1))
-        raw_labels[idx0 + 1] == 0 && continue
+        raw_labels[idx0 + 1] in route_set || continue
         mask[x - crop_lo[1] + 1, y - crop_lo[2] + 1, z - crop_lo[3] + 1] = true
     end
     count(mask) > 0 || error("Right-leg route tissue mask is empty")
@@ -199,26 +274,8 @@ end
 
 function write_right_leg_route_mask_artifacts(output_dir::AbstractString, mask::BitArray{3},
                                              origin_cm::SVector{3, Float64}, spacing_cm::SVector{3, Float64})
-    raw_path = joinpath(output_dir, "right_leg_route_tissue_mask.raw")
-    nhdr_path = joinpath(output_dir, "right_leg_route_tissue_mask.nhdr")
-    open(raw_path, "w") do io
-        for k in axes(mask, 3), j in axes(mask, 2), i in axes(mask, 1)
-            write(io, UInt8(mask[i, j, k] ? 1 : 0))
-        end
-    end
-    open(nhdr_path, "w") do io
-        println(io, "NRRD0005")
-        println(io, "type: uchar")
-        println(io, "dimension: 3")
-        println(io, "space: left-posterior-superior")
-        println(io, "sizes: $(size(mask, 1)) $(size(mask, 2)) $(size(mask, 3))")
-        println(io, "space directions: ($(spacing_cm[1] * 10),0,0) (0,$(spacing_cm[2] * 10),0) (0,0,$(spacing_cm[3] * 10))")
-        println(io, "space origin: ($(origin_cm[1] * 10),$(origin_cm[2] * 10),$(origin_cm[3] * 10))")
-        println(io, "encoding: raw")
-        println(io, "endian: little")
-        println(io, "data file: right_leg_route_tissue_mask.raw")
-    end
-    return nhdr_path, raw_path
+    return write_right_leg_binary_mask_artifacts(output_dir, mask, origin_cm, spacing_cm;
+        basename="right_leg_route_tissue_mask")
 end
 
 function select_existing_path(paths::Vararg{AbstractString})
@@ -321,6 +378,7 @@ function select_main_paths(paths::Vector{XCATSeedPath}; max_paths::Int=6, min_le
         [p for p in paths if path_length_cm(p) >= min_length_cm],
         by=p -> -(path_length_cm(p) * mean(p.diameters_cm)),
     )
+    max_paths <= 0 && return ranked
     return ranked[1:min(max_paths, length(ranked))]
 end
 
@@ -330,6 +388,87 @@ function select_longest_paths(paths::Vector{XCATSeedPath}; max_paths::Int=6, min
         by=p -> -path_length_cm(p),
     )
     return ranked[1:min(max_paths, length(ranked))]
+end
+
+function vessel_path_score(path::XCATSeedPath, score::Symbol)
+    if score == :length
+        return path_length_cm(path)
+    elseif score == :length_mean_diameter
+        return path_length_cm(path) * mean(path.diameters_cm)
+    elseif score == :proximal_diameter
+        return proximal_root_diameter_cm(path)
+    elseif score == :capacity
+        return proximal_root_diameter_cm(path)^3
+    else
+        error("Unknown vessel path score `$score`")
+    end
+end
+
+function select_vessel_paths(paths::Vector{XCATSeedPath};
+                             max_paths::Int=0,
+                             min_length_cm::Float64=0.0,
+                             min_proximal_diameter_cm::Float64=0.0,
+                             score::Symbol=:length_mean_diameter,
+                             role::AbstractString="vessel")
+    rows = NamedTuple[]
+    eligible = XCATSeedPath[]
+    eligible_score = Float64[]
+    for path in paths
+        len_cm = path_length_cm(path)
+        prox_d = proximal_root_diameter_cm(path)
+        mean_d = mean(path.diameters_cm)
+        max_d = maximum(path.diameters_cm)
+        reason = ""
+        if len_cm < min_length_cm
+            reason = "below_min_length"
+        elseif prox_d < min_proximal_diameter_cm
+            reason = "below_min_proximal_diameter"
+        end
+        path_score = vessel_path_score(path, score)
+        if isempty(reason)
+            push!(eligible, path)
+            push!(eligible_score, path_score)
+        end
+        push!(rows, (
+            role=String(role),
+            surface=path.surface,
+            points=length(path.points),
+            length_cm=len_cm,
+            min_diameter_cm=minimum(path.diameters_cm),
+            mean_diameter_cm=mean_d,
+            max_diameter_cm=max_d,
+            proximal_diameter_cm=prox_d,
+            score=path_score,
+            selected=false,
+            rank=0,
+            reason=isempty(reason) ? "eligible" : reason,
+        ))
+    end
+
+    order = sort(collect(eachindex(eligible)); by=i -> (-eligible_score[i], eligible[i].surface))
+    selected_count = max_paths <= 0 ? length(order) : min(max_paths, length(order))
+    selected_surfaces = Set{String}()
+    selected_rank = Dict{String, Int}()
+    selected = XCATSeedPath[]
+    for (rank, idx) in enumerate(order[1:selected_count])
+        path = eligible[idx]
+        push!(selected, path)
+        push!(selected_surfaces, path.surface)
+        selected_rank[path.surface] = rank
+    end
+
+    audited = NamedTuple[]
+    for row in rows
+        if row.surface in selected_surfaces
+            push!(audited, merge(row, (selected=true, rank=selected_rank[row.surface], reason="selected")))
+        elseif row.reason == "eligible"
+            push!(audited, merge(row, (reason="eligible_not_selected",)))
+        else
+            push!(audited, row)
+        end
+    end
+    audited = sort(audited; by=r -> (r.selected ? 0 : 1, r.rank == 0 ? typemax(Int) : r.rank, -r.score, r.surface))
+    return selected, audited
 end
 
 function raw_label_centerline_paths(raw_labels, dims, labels::Vector{UInt16}, keep_x,
@@ -421,6 +560,176 @@ function mask_value(mask::BitArray{3}, i::Int, j::Int, k::Int)
     dims = size(mask)
     (1 <= i <= dims[1] && 1 <= j <= dims[2] && 1 <= k <= dims[3]) || return false
     return mask[i, j, k]
+end
+
+function mask_value_at_point(mask::BitArray{3}, origin_cm::SVector{3, Float64},
+                             spacing_cm::SVector{3, Float64}, point::SVector{3, Float64})
+    return mask_value(mask, mask_index_from_point(mask, origin_cm, spacing_cm, point)...)
+end
+
+function vessel_path_mask_counts(path::XCATSeedPath, mask::BitArray{3},
+                                 origin_cm::SVector{3, Float64}, spacing_cm::SVector{3, Float64})
+    outside = count(p -> !mask_value_at_point(mask, origin_cm, spacing_cm, p), path.points)
+    return (outside_points=outside, inside_points=length(path.points) - outside)
+end
+
+function mark_paths_in_mask!(mask::BitArray{3}, paths::Vector{XCATSeedPath},
+                             origin_cm::SVector{3, Float64}, spacing_cm::SVector{3, Float64};
+                             radius_voxels::Int=1)
+    radius_voxels < 0 && error("radius_voxels must be >= 0")
+    dims = size(mask)
+    step_cm = 0.5 * minimum(spacing_cm)
+    mark_point!(point) = begin
+        i0, j0, k0 = mask_index_from_point(mask, origin_cm, spacing_cm, point)
+        for k in max(1, k0 - radius_voxels):min(dims[3], k0 + radius_voxels),
+            j in max(1, j0 - radius_voxels):min(dims[2], j0 + radius_voxels),
+            i in max(1, i0 - radius_voxels):min(dims[1], i0 + radius_voxels)
+            mask[i, j, k] = true
+        end
+    end
+    for path in paths
+        isempty(path.points) && continue
+        mark_point!(first(path.points))
+        for idx in 2:length(path.points)
+            a = path.points[idx - 1]
+            b = path.points[idx]
+            segment_length = norm(b - a)
+            steps = max(1, ceil(Int, segment_length / step_cm))
+            for step in 1:steps
+                mark_point!(a + (step / steps) * (b - a))
+            end
+        end
+    end
+    return mask
+end
+
+function nearest_mask_point_cm(mask::BitArray{3}, origin_cm::SVector{3, Float64},
+                               spacing_cm::SVector{3, Float64}, point::SVector{3, Float64};
+                               max_radius_voxels::Int=2)
+    max_radius_voxels < 0 && error("max_radius_voxels must be >= 0")
+    i0, j0, k0 = mask_index_from_point(mask, origin_cm, spacing_cm, point)
+    dims = size(mask)
+    best_point = point
+    best_d2 = Inf
+    for radius in 0:max_radius_voxels
+        for k in max(1, k0 - radius):min(dims[3], k0 + radius),
+            j in max(1, j0 - radius):min(dims[2], j0 + radius),
+            i in max(1, i0 - radius):min(dims[1], i0 + radius)
+            mask[i, j, k] || continue
+            candidate = SVector(
+                origin_cm[1] + (i - 0.5) * spacing_cm[1],
+                origin_cm[2] + (j - 0.5) * spacing_cm[2],
+                origin_cm[3] + (k - 0.5) * spacing_cm[3])
+            d2 = sum(abs2, candidate - point)
+            if d2 < best_d2
+                best_d2 = d2
+                best_point = candidate
+            end
+        end
+        isfinite(best_d2) && return (found=true, point=best_point, distance_cm=sqrt(best_d2))
+    end
+    return (found=false, point=point, distance_cm=Inf)
+end
+
+function vertex_touches_xcat_segment(tree::GrowthTree, vertex::Int)
+    incoming = tree.incoming_segment[vertex]
+    incoming != 0 && tree.is_xcat[incoming] && return true
+    for child in tree.children[vertex]
+        seg = tree.incoming_segment[child]
+        seg != 0 && tree.is_xcat[seg] && return true
+    end
+    return false
+end
+
+function vertex_touches_grown_segment(tree::GrowthTree, vertex::Int)
+    incoming = tree.incoming_segment[vertex]
+    incoming != 0 && !tree.is_xcat[incoming] && return true
+    for child in tree.children[vertex]
+        seg = tree.incoming_segment[child]
+        seg != 0 && !tree.is_xcat[seg] && return true
+    end
+    return false
+end
+
+function repair_grown_segments_to_mask!(tree::GrowthTree, mask::BitArray{3},
+                                        origin_cm::SVector{3, Float64},
+                                        spacing_cm::SVector{3, Float64};
+                                        max_radius_voxels::Int=2,
+                                        max_passes::Int=3)
+    max_passes < 1 && error("max_passes must be >= 1")
+    repaired = 0
+    skipped = 0
+    max_shift_cm = 0.0
+    completed_passes = 0
+    for pass in 1:max_passes
+        completed_passes = pass
+        repaired_this_pass = 0
+        for vertex in eachindex(tree.vertices)
+            vertex_touches_grown_segment(tree, vertex) || continue
+            vertex_touches_xcat_segment(tree, vertex) && continue
+            point = tree.vertices[vertex]
+            mask_value_at_point(mask, origin_cm, spacing_cm, point) && continue
+            nearest = nearest_mask_point_cm(mask, origin_cm, spacing_cm, point;
+                max_radius_voxels=max_radius_voxels)
+            if nearest.found
+                tree.vertices[vertex] = nearest.point
+                repaired += 1
+                repaired_this_pass += 1
+                max_shift_cm = max(max_shift_cm, nearest.distance_cm)
+            else
+                skipped += 1
+            end
+        end
+        n_before = length(tree.segment_start)
+        for seg_id in 1:n_before
+            tree.is_xcat[seg_id] && continue
+            a = tree.vertices[tree.segment_start[seg_id]]
+            b = tree.vertices[tree.segment_end[seg_id]]
+            midpoint = 0.5 * (a + b)
+            mask_value_at_point(mask, origin_cm, spacing_cm, midpoint) && continue
+            nearest = nearest_mask_point_cm(mask, origin_cm, spacing_cm, midpoint;
+                max_radius_voxels=max_radius_voxels)
+            if nearest.found
+                VascularTreeSim._split_segment!(tree, seg_id, nearest.point)
+                repaired += 1
+                repaired_this_pass += 1
+                max_shift_cm = max(max_shift_cm, nearest.distance_cm)
+            else
+                skipped += 1
+            end
+        end
+        repaired_this_pass == 0 && break
+    end
+    return (repaired=repaired, skipped=skipped, max_shift_cm=max_shift_cm, passes=completed_passes)
+end
+
+repair_grown_segment_midpoints_to_mask!(args...; kwargs...) = repair_grown_segments_to_mask!(args...; kwargs...)
+
+function write_vessel_path_audit_csv(path::AbstractString, rows;
+                                     mask::Union{Nothing, BitArray{3}}=nothing,
+                                     origin_cm::Union{Nothing, SVector{3, Float64}}=nothing,
+                                     spacing_cm::Union{Nothing, SVector{3, Float64}}=nothing,
+                                     paths::Vector{XCATSeedPath}=XCATSeedPath[])
+    by_surface = Dict(p.surface => p for p in paths)
+    open(path, "w") do io
+        println(io, "role,surface,selected,rank,reason,points,length_mm,min_diameter_mm,mean_diameter_mm,max_diameter_mm,proximal_diameter_mm,score,outside_mask_points")
+        for row in rows
+            outside = ""
+            if mask !== nothing && origin_cm !== nothing && spacing_cm !== nothing && haskey(by_surface, row.surface)
+                outside = string(vessel_path_mask_counts(by_surface[row.surface], mask, origin_cm, spacing_cm).outside_points)
+            end
+            @printf(io, "%s,%s,%s,%d,%s,%d,%.6f,%.6f,%.6f,%.6f,%.6f,%.8f,%s\n",
+                row.role, row.surface, string(row.selected), row.rank, row.reason, row.points,
+                10.0 * row.length_cm,
+                10.0 * row.min_diameter_cm,
+                10.0 * row.mean_diameter_cm,
+                10.0 * row.max_diameter_cm,
+                10.0 * row.proximal_diameter_cm,
+                row.score,
+                outside)
+        end
+    end
+    return path
 end
 
 function distance_to_mask_cm(mask::BitArray{3}, origin_cm::SVector{3, Float64},

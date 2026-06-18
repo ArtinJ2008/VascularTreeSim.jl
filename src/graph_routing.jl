@@ -10,7 +10,7 @@ end
 
 struct GraphSpatialGrid
     points::Vector{SVector{3,Float64}}
-    grid::PointCloudGrid
+    grid::PointCloudGrid 
 end
 
 function graph_connected_components(graph::DomainGraph)

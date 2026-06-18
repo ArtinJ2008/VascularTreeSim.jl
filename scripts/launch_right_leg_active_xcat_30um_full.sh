@@ -30,7 +30,7 @@ export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-2}"
     echo "graph_block_size=1"
     echo "max_segment_length_cm=0.05"
     echo "route_dilation_voxels=0"
-    echo "main_xcat_artery_seeds=6"
+    echo "main_xcat_artery_seeds=all eligible"
 } > "${OUT}/run_metadata.txt"
 
 exec /home/molloi-lab/.juliaup/bin/julia --project=. \
@@ -54,7 +54,7 @@ exec /home/molloi-lab/.juliaup/bin/julia --project=. \
     true \
     true \
     32 \
-    6 \
+    0 \
     1.25 \
     6 \
     > "${LOG}" 2>&1
