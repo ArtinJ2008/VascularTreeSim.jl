@@ -21,6 +21,12 @@ using StaticArrays
 const RIGHT_LEG_50UM_DEFAULT_OUTPUT_DIR = joinpath(dirname(@__DIR__), "output", "xcat_right_leg_corrected_50um_full")
 const RIGHT_LEG_50UM_DEFAULT_NRB_PATH = joinpath(RIGHT_LEG_TRIAL_DEFAULT_INPUT_DIR, "both_legs_1.nrb")
 const RIGHT_LEG_50UM_TREE_NAME = "XCATRightLegCorrected50um"
+const RIGHT_LEG_50UM_NRB_COORDINATE_SCALE = 0.1
+const RIGHT_LEG_50UM_NRB_DOMAIN_VOXEL_SPACING_CM = 0.1
+const RIGHT_LEG_50UM_NRB_DOMAIN_SAMPLES = (48, 48)
+const RIGHT_LEG_50UM_EXPLICIT_TERMINAL_UM = 200.0
+const RIGHT_LEG_50UM_SUBDIVISION_MAX_LD_RATIO = 25.0
+const RIGHT_LEG_50UM_SUBDIVISION_CLIP_BELOW_UM = 0.0
 const RIGHT_LEG_50UM_FRONTIER_BATCH = 4096
 const RIGHT_LEG_50UM_GRAPH_BLOCK_SIZE = 1
 const RIGHT_LEG_50UM_MIN_FRONTIER_SEPARATION_CM = 0.01
@@ -64,6 +70,12 @@ function parse_bool_arg(value::AbstractString)
     text in ("true", "t", "yes", "y", "1") && return true
     text in ("false", "f", "no", "n", "0") && return false
     error("Expected a boolean value, got `$value`")
+end
+
+function parse_pair_arg(value::AbstractString)
+    parts = split(strip(String(value)), ',')
+    length(parts) == 2 || error("Expected pair `a,b`, got `$value`")
+    return (parse(Int, strip(parts[1])), parse(Int, strip(parts[2])))
 end
 
 function enforce_graph_resolution_guard!(graph_block_size::Int, spacing_cm::SVector{3, Float64},
@@ -305,6 +317,19 @@ function write_target_demand_audit_csv(path::AbstractString, audit)
     return path
 end
 
+function nrb_target_audit(domain::VoxelShellDomain, sampled_count::Int; class_name::AbstractString="nrb_target")
+    voxels = count(domain.mask)
+    return [(
+        class=String(class_name),
+        voxel_count=voxels,
+        demand_weight=1.0,
+        demand_mass=Float64(voxels),
+        expected_fraction=1.0,
+        sampled_count=sampled_count,
+        sampled_fraction=sampled_count == 0 ? 0.0 : 1.0,
+    )]
+end
+
 _safe_ratio(numerator::Real, denominator::Real) =
     denominator == 0 || !isfinite(denominator) ? NaN : numerator / denominator
 
@@ -435,63 +460,47 @@ function write_right_leg_full_summary(path::AbstractString, raw_path, organ_ids_
         println(io)
         println(io, "- Started: $(started_at)")
         println(io, "- Finished: $(finished_at)")
-        println(io, "- XCAT raw tissue label volume: $(raw_path)")
-        println(io, "- XCAT NRB vessel geometry: $(nrb_path)")
-        println(io, "- Organ IDs: $(organ_ids_path)")
-        println(io, "- XCAT log: $(log_path)")
-        if vessel_source == "nrb"
-            println(io, "- Artery source: XCAT NRB grouped surface centerlines: arteries_rleg")
-            println(io, "- Vein source: XCAT NRB grouped surface centerlines: veins_rleg")
-        else
-            println(io, "- Artery source: voxelized raw label volume: arteries_rleg")
-            println(io, "- Vein source: voxelized raw label volume: veins_rleg")
-        end
-        println(io, "- Source dims: $(xcat_info.dims)")
-        println(io, "- Source slice range: $(xcat_info.start_slice)-$(xcat_info.end_slice)")
-        println(io, "- Source spacing: $(round.(Tuple(xcat_info.spacing_cm .* 10); digits=3)) mm")
-        println(io, "- Kept right-leg half: $(keep_desc)")
-        println(io, "- leg_right half counts: lower-x=$(kept_counts[1]), upper-x=$(kept_counts[2])")
-        println(io, "- Vessel-aware crop pad: $(crop_pad_voxels) voxel(s)")
-        println(io, "- Crop lo index: $(crop_lo)")
-        println(io, "- Crop hi index: $(crop_hi)")
-        println(io, "- Cropped dims: $(size(domain.mask))")
+        println(io, "- XCAT NRB anatomy and vessel geometry: $(nrb_path)")
+        println(io, "- XCAT raw tissue label volume: not used for geometry in this run")
+        println(io, "- XCAT log: $(log_path) (metadata only)")
+        println(io, "- Artery source: XCAT NRB grouped surface centerlines: arteries_rleg")
+        println(io, "- Vein source: XCAT NRB grouped surface centerlines: veins_rleg")
+        println(io, "- Domain source: XCAT NRB grouped surfaces")
+        println(io, "- Target dims: $(size(domain.mask))")
         println(io, "- Foreground right-leg muscle/foot-muscle voxels: $(muscle_tissue_voxels)")
-        println(io, "- Muscle label count: $(muscle_label_count)")
+        println(io, "- Muscle surface count: $(muscle_label_count)")
         println(io, "- Growth target tissue mode: $(target_tissue_mode)")
         if target_tissue_mode == "muscle"
-            println(io, "- Growth target mask: right-leg skeletal/foot muscle labels only. The route mask can still include soft tissue corridors.")
+            println(io, "- Growth target mask: right-leg skeletal/foot muscle NRB surfaces only. The route mask can still include soft tissue corridors.")
         else
-            println(io, "- Growth target mask: right-leg soft tissue, including muscle, leg/foot envelope, fat/adipose, skin, and subcutaneous labels; XCAT vessel labels are excluded from target sampling.")
+            println(io, "- Growth target mask: right-leg soft-tissue NRB envelope surfaces (`leg_right` and `foot_right*`).")
         end
         println(io, "- Growth target tissue voxels: $(mask_info.foreground)")
-        println(io, "- Growth target label count: $(target_label_count)")
-        println(io, "- Growth target demand mode: $(target_demand_mode)")
-        println(io, "- Growth target demand weights: $(target_demand_weights)")
+        println(io, "- Growth target surface count: $(target_label_count)")
+        println(io, "- Growth target demand mode: uniform NRB-domain sampling")
         println(io, "- Seed territory audit CSV: $(seed_territory_audit_csv)")
-        println(io, "- Routing mask: cropped right-leg soft-tissue XCAT labels, box-dilated by $(route_dilation_voxels) voxel(s)")
+        println(io, "- Routing mask: right-leg soft-tissue NRB envelope with fixed NRB vessels marked in")
         println(io, "- Routing tissue voxels: $(route_tissue_voxels)")
-        println(io, "- Cropped extent: $(round(ext_cm[1]; digits=2)) x $(round(ext_cm[2]; digits=2)) x $(round(ext_cm[3]; digits=2)) cm")
+        println(io, "- Target extent: $(round(ext_cm[1]; digits=2)) x $(round(ext_cm[2]; digits=2)) x $(round(ext_cm[3]; digits=2)) cm")
         @printf(io, "- Fixed vessel proximity filter: kept path sections within %.1f mm of the soft target mask\n",
             MAX_FIXED_VESSEL_DISTANCE_TO_MUSCLE_CM * 10.0)
         @printf(io, "- Active artery growth seed min length: %.2f mm\n", growth_artery_min_length_cm * 10.0)
         @printf(io, "- Fixed artery structural export min length: %.2f mm\n", fixed_artery_min_length_cm * 10.0)
         @printf(io, "- Fixed vein export min length: %.2f mm\n", fixed_vein_min_length_cm * 10.0)
         println(io, "- Fixed artery/vein route-mask radius: $(fixed_vessel_radius_voxels) voxel(s)")
-        println(io, "- Terminal branch diameter: $(round(terminal_um; digits=3)) um")
+        println(io, "- Final terminal branch diameter: $(round(terminal_um; digits=3)) um")
         println(io, "- Flow-ready hemodynamic export explicit minimum diameter: $(round(flow_explicit_min_diameter_um; digits=3)) um")
         println(io, "- Combined geometry CSV includes fixed XCAT veins for visualization/reference; arterial flow should use the arterial/hemodynamic CSV exports.")
-        println(io, "- Target added branches: $(target_branches)")
+        println(io, "- Target added routed-growth branches: $(target_branches)")
         println(io, "- Independent artery growth seeds: $(growth_artery_count)")
         println(io, "- Growth seed paths are oriented with the higher-z endpoint as the proximal/root side.")
         println(io, "- Seed capacity uses the maximum diameter in the first 8 proximal points, not the full-path maximum.")
         println(io, "- Growth capacity is distributed by proximal diameter cubed; territory distance weighting uses proximal diameter, so tissue-volume prior scales with diameter cubed rather than diameter to the ninth.")
         println(io, "- Component reachability: enabled; tissue targets can be claimed only by seeds connected through the legal route graph.")
         if target_tissue_mode == "muscle"
-            println(io, "- Coverage targets are sampled from muscle targets only.")
-        elseif target_demand_mode == "weighted"
-            println(io, "- Coverage targets are sampled from the soft-tissue target mask with tissue-class demand weights.")
+            println(io, "- Coverage targets are sampled uniformly from the NRB muscle target domain.")
         else
-            println(io, "- Coverage targets are sampled uniformly from the soft-tissue target mask.")
+            println(io, "- Coverage targets are sampled uniformly from the NRB soft-tissue envelope target domain.")
         end
         println(io, "- Per-seed branch caps: " *
             join(["$(name)=$(branch_caps[name])" for name in sort(collect(keys(branch_caps)))], ", "))
@@ -641,48 +650,72 @@ function main_right_leg_xcat_50um_gpu()
     max_terminal_path_resistance_rel = parse(Float64, get(ENV, "VTS_MAX_TERMINAL_PATH_RESISTANCE_REL", string(RIGHT_LEG_50UM_MAX_TERMINAL_PATH_RESISTANCE_REL)))
     blood_viscosity_poise = parse(Float64, get(ENV, "VTS_BLOOD_VISCOSITY_POISE", string(RIGHT_LEG_50UM_BLOOD_VISCOSITY_POISE)))
     vessel_source = lowercase(strip(get(ENV, "VTS_XCAT_VESSEL_SOURCE", RIGHT_LEG_50UM_VESSEL_SOURCE)))
-    vessel_source in ("nrb", "raw_label") || error("VTS_XCAT_VESSEL_SOURCE must be `nrb` or `raw_label`, got `$vessel_source`")
+    vessel_source == "nrb" || error("Right-leg full runs now require VTS_XCAT_VESSEL_SOURCE=nrb; got `$vessel_source`")
+    nrb_voxel_spacing_cm = parse(Float64, get(ENV, "VTS_NRB_DOMAIN_VOXEL_SPACING_CM", string(RIGHT_LEG_50UM_NRB_DOMAIN_VOXEL_SPACING_CM)))
+    nrb_domain_samples = parse_pair_arg(get(ENV, "VTS_NRB_DOMAIN_SAMPLES", "$(RIGHT_LEG_50UM_NRB_DOMAIN_SAMPLES[1]),$(RIGHT_LEG_50UM_NRB_DOMAIN_SAMPLES[2])"))
+    explicit_terminal_um = parse(Float64, get(ENV, "VTS_EXPLICIT_TERMINAL_UM", string(RIGHT_LEG_50UM_EXPLICIT_TERMINAL_UM)))
+    subdivision_max_ld_ratio = parse(Float64, get(ENV, "VTS_SUBDIVISION_MAX_LD_RATIO", string(RIGHT_LEG_50UM_SUBDIVISION_MAX_LD_RATIO)))
+    subdivision_clip_below_um = parse(Float64, get(ENV, "VTS_SUBDIVISION_CLIP_BELOW_UM", string(RIGHT_LEG_50UM_SUBDIVISION_CLIP_BELOW_UM)))
     target_tissue_mode = target_tissue_mode_from_env()
     target_demand_mode = target_demand_mode_from_env()
     target_demand_weights_spec = get(ENV, "VTS_TARGET_DEMAND_WEIGHTS", RIGHT_LEG_50UM_TARGET_DEMAND_WEIGHTS)
     target_demand_weights = parse_target_demand_weights(target_demand_weights_spec)
-    terminal_cm = terminal_um / 1e4
+    final_terminal_cm = terminal_um / 1e4
+    explicit_terminal_cm = explicit_terminal_um / 1e4
+    growth_terminal_cm = final_terminal_cm < explicit_terminal_cm ? explicit_terminal_cm : final_terminal_cm
+    subdivision_clip_below_cm = subdivision_clip_below_um / 1e4
 
     mkpath(output_dir)
     xcat_info = parse_xcat_log(log_path)
-    enforce_graph_resolution_guard!(graph_block_size, xcat_info.spacing_cm, terminal_um)
-    name_to_labels, _ = parse_organ_ids(organ_ids_path)
-    label_classes = target_label_classes(name_to_labels)
-    raw_labels = load_xcat_uint16_raw(raw_path, xcat_info.dims)
-    crop_pad_voxels = vessel_aware_crop_pad_voxels(xcat_info.spacing_cm;
-        vessel_radius_voxels=RIGHT_LEG_50UM_ROUTE_VESSEL_RADIUS_VOXELS)
+    enforce_graph_resolution_guard!(graph_block_size, SVector(nrb_voxel_spacing_cm, nrb_voxel_spacing_cm, nrb_voxel_spacing_cm), terminal_um)
+    crop_pad_voxels = 0
+    keep_desc = "nrb-right-leg-surfaces"
+    lower_count = 0
+    upper_count = 0
+    crop_lo = (1, 1, 1)
+    crop_hi = (0, 0, 0)
 
-    right_leg_labels = labels_for(name_to_labels, ["leg_right"])
-    keep_x, lower_count, upper_count, keep_desc = choose_right_half(raw_labels, xcat_info.dims, right_leg_labels)
-    muscle_labels = right_leg_muscle_labels(name_to_labels)
-    full_muscle_mask, muscle_counts = build_right_leg_muscle_mask(raw_labels, xcat_info.dims, muscle_labels, keep_x)
-    soft_target_labels = right_leg_soft_target_labels(name_to_labels)
-    full_soft_target_mask, soft_target_counts = build_right_leg_label_mask(raw_labels, xcat_info.dims, soft_target_labels, keep_x;
-        description="Right-leg soft target")
-    full_target_mask = target_tissue_mode == "muscle" ? full_muscle_mask : full_soft_target_mask
-    target_counts = target_tissue_mode == "muscle" ? muscle_counts : soft_target_counts
-    target_mask, origin_cm, crop_lo, crop_hi = crop_mask(full_target_mask, xcat_info.spacing_cm; pad=crop_pad_voxels)
-    mask = crop_mask_to_bounds(full_muscle_mask, crop_lo, crop_hi)
-    nhdr_path, mask_raw_path = write_right_leg_mask_artifacts(output_dir, mask, origin_cm, xcat_info.spacing_cm)
-    target_nhdr_path, target_mask_raw_path = write_right_leg_target_mask_artifacts(output_dir, target_mask, origin_cm, xcat_info.spacing_cm)
-    domain, mask_info = build_domain_from_mask(target_mask, origin_cm, xcat_info.spacing_cm)
-    route_labels = right_leg_route_tissue_labels(name_to_labels)
-    route_mask_base = build_right_leg_route_tissue_mask(raw_labels, xcat_info.dims, route_labels, keep_x, crop_lo, crop_hi)
-    route_mask = dilate_mask_box(route_mask_base, route_dilation_voxels)
+    surfaces = parse_xcat_grouped_nrb(nrb_path)
+    soft_surfaces = right_leg_nrb_soft_surfaces(surfaces)
+    muscle_surfaces = right_leg_nrb_muscle_surfaces(surfaces, soft_surfaces)
+    target_surfaces = target_tissue_mode == "muscle" ? muscle_surfaces : soft_surfaces
+    target_surface_count = length(target_surfaces)
+    muscle_surface_count = length(muscle_surfaces)
+    route_surface_count = length(soft_surfaces)
 
-    if vessel_source == "nrb"
-        artery_paths_all = nrb_group_seed_paths(nrb_path, xcat_info, "arteries_rleg")
-    else
-        artery_labels = labels_for(name_to_labels, ["arteries_rleg"])
-        artery_paths_all = raw_label_centerline_paths(raw_labels, xcat_info.dims, artery_labels, keep_x,
-            xcat_info.spacing_cm; label_prefix="arteries_rleg_raw_")
-    end
-    artery_paths_near = clip_paths_to_mask_proximity(artery_paths_all, target_mask, origin_cm, xcat_info.spacing_cm;
+    domain = build_multipatch_voxel_domain_floodfill(target_surfaces;
+        coordinate_scale=RIGHT_LEG_50UM_NRB_COORDINATE_SCALE,
+        voxel_spacing_cm=nrb_voxel_spacing_cm,
+        outer_samples=nrb_domain_samples,
+        dilation_radius=1)
+    mask_info = mask_stats(domain.mask, domain.origin_cm, domain.spacing_cm)
+    muscle_domain = target_tissue_mode == "muscle" ? domain : build_multipatch_voxel_domain_floodfill(muscle_surfaces;
+        coordinate_scale=RIGHT_LEG_50UM_NRB_COORDINATE_SCALE,
+        voxel_spacing_cm=nrb_voxel_spacing_cm,
+        outer_samples=nrb_domain_samples,
+        dilation_radius=1)
+    route_domain = target_tissue_mode == "soft" ? domain : build_multipatch_voxel_domain_floodfill(soft_surfaces;
+        coordinate_scale=RIGHT_LEG_50UM_NRB_COORDINATE_SCALE,
+        voxel_spacing_cm=nrb_voxel_spacing_cm,
+        outer_samples=nrb_domain_samples,
+        dilation_radius=1)
+    route_mask_info = mask_stats(route_domain.mask, route_domain.origin_cm, route_domain.spacing_cm)
+
+    target_mask = domain.mask
+    mask = muscle_domain.mask
+    route_mask = copy(route_domain.mask)
+    origin_cm = domain.origin_cm
+    spacing_cm = domain.spacing_cm
+    route_origin_cm = route_domain.origin_cm
+    route_spacing_cm = route_domain.spacing_cm
+    crop_hi = size(target_mask)
+
+    nhdr_path, mask_raw_path = write_right_leg_mask_artifacts(output_dir, mask, muscle_domain.origin_cm, muscle_domain.spacing_cm)
+    target_nhdr_path, target_mask_raw_path = write_right_leg_target_mask_artifacts(output_dir, target_mask, origin_cm, spacing_cm)
+
+    artery_paths_all = nrb_group_seed_paths_from_surfaces(surfaces, "arteries_rleg";
+        coordinate_scale=RIGHT_LEG_50UM_NRB_COORDINATE_SCALE)
+    artery_paths_near = clip_paths_to_mask_proximity(artery_paths_all, route_mask, route_origin_cm, route_spacing_cm;
         max_distance_cm=MAX_FIXED_VESSEL_DISTANCE_TO_MUSCLE_CM)
     oriented_artery_paths_near = [orient_right_leg_root_path(path) for path in artery_paths_near]
     fixed_artery_paths, fixed_artery_audit = select_vessel_paths(oriented_artery_paths_near;
@@ -695,20 +728,15 @@ function main_right_leg_xcat_50um_gpu()
         min_length_cm=growth_artery_min_length_cm,
         score=:length_mean_diameter,
         role="growth_artery")
-    isempty(artery_paths) && error("No usable raw-label artery seed paths were selected")
+    isempty(artery_paths) && error("No usable NRB artery seed paths were selected")
     growth_artery_count = length(artery_paths)
     growth_artery_paths = artery_paths[1:growth_artery_count]
     growth_surfaces = Set(path.surface for path in growth_artery_paths)
     artery_overlay_paths = [path for path in fixed_artery_paths if !(path.surface in growth_surfaces)]
 
-    if vessel_source == "nrb"
-        vein_paths_all = nrb_group_seed_paths(nrb_path, xcat_info, "veins_rleg")
-    else
-        vein_labels = labels_for(name_to_labels, ["veins_rleg"])
-        vein_paths_all = raw_label_centerline_paths(raw_labels, xcat_info.dims, vein_labels, keep_x,
-            xcat_info.spacing_cm; label_prefix="vein_raw_")
-    end
-    vein_paths_near = clip_paths_to_mask_proximity(vein_paths_all, target_mask, origin_cm, xcat_info.spacing_cm;
+    vein_paths_all = nrb_group_seed_paths_from_surfaces(surfaces, "veins_rleg";
+        coordinate_scale=RIGHT_LEG_50UM_NRB_COORDINATE_SCALE)
+    vein_paths_near = clip_paths_to_mask_proximity(vein_paths_all, route_mask, route_origin_cm, route_spacing_cm;
         max_distance_cm=MAX_FIXED_VESSEL_DISTANCE_TO_MUSCLE_CM)
     vein_paths, vein_audit = select_vessel_paths(vein_paths_near;
         max_paths=fixed_vein_exports,
@@ -717,19 +745,23 @@ function main_right_leg_xcat_50um_gpu()
         role="fixed_vein")
 
     selected_fixed_paths = vcat(fixed_artery_paths, vein_paths)
-    mark_paths_in_mask!(route_mask, selected_fixed_paths, origin_cm, xcat_info.spacing_cm;
+    mark_paths_in_mask!(route_mask, selected_fixed_paths, route_origin_cm, route_spacing_cm;
         radius_voxels=RIGHT_LEG_50UM_ROUTE_VESSEL_RADIUS_VOXELS)
-    route_mask .|= target_mask
-    route_nhdr_path, route_mask_raw_path = write_right_leg_route_mask_artifacts(output_dir, route_mask, origin_cm, xcat_info.spacing_cm)
-    route_domain, route_mask_info = build_domain_from_mask(route_mask, origin_cm, xcat_info.spacing_cm)
+    route_nhdr_path, route_mask_raw_path = write_right_leg_route_mask_artifacts(output_dir, route_mask, route_origin_cm, route_spacing_cm)
+    route_domain = VoxelShellDomain(route_mask, route_domain.origin_cm, route_domain.spacing_cm, route_domain.center_cm,
+        route_domain.outer_surface_points, route_domain.outer_surface_normals,
+        route_domain.cavity_surface_points, route_domain.cavity_surface_normals,
+        route_domain.outer_query_grid, route_domain.cavity_query_grids)
+    route_mask_info = mask_stats(route_mask, route_origin_cm, route_spacing_cm)
 
-    trees, growth_tree_names = make_right_leg_growth_trees(growth_artery_paths; terminal_diameter_cm=terminal_cm)
+    trees, growth_tree_names = make_right_leg_growth_trees(growth_artery_paths; terminal_diameter_cm=growth_terminal_cm)
     root_diameters = [trees[name].root_diameter_cm for name in growth_tree_names]
     capacity_weights = Dict(name => artery_weight(path) for (name, path) in zip(growth_tree_names, growth_artery_paths))
     territory_distance_weights = Dict(name => proximal_root_diameter_cm(path) for (name, path) in zip(growth_tree_names, growth_artery_paths))
+    subdivision_factor = final_terminal_cm < growth_terminal_cm ? max(1, ceil(Int, (growth_terminal_cm / final_terminal_cm)^3)) : 1
     target_branches = lowercase(target_arg) == "auto" ?
-        ceil(Int, (maximum(root_diameters) / terminal_cm)^3) :
-        parse(Int, target_arg)
+        ceil(Int, (maximum(root_diameters) / growth_terminal_cm)^3) :
+        max(1, ceil(Int, parse(Int, target_arg) / subdivision_factor))
     branch_caps = branch_caps_from_weights(growth_tree_names,
         [capacity_weights[name] for name in growth_tree_names], target_branches)
     coverage_count = max(target_branches, ceil(Int, target_branches * coverage_multiplier))
@@ -753,14 +785,18 @@ function main_right_leg_xcat_50um_gpu()
     println("Started: $(started_at)")
     println("Raw tissue labels: $(raw_path)")
     println("NRB vessel geometry: $(nrb_path)")
+    println("Anatomy/domain source: XCAT NRB")
     println("Vessel source: $(vessel_source)")
     println("Output: $(output_dir)")
-    println("Terminal diameter: $(terminal_um) um")
+    println("Final terminal diameter: $(terminal_um) um")
+    println("Explicit routed growth terminal diameter: $(round(growth_terminal_cm * 1e4; digits=3)) um")
+    final_terminal_cm < growth_terminal_cm &&
+        println("Post-growth subdivision: $(round(growth_terminal_cm * 1e4; digits=3)) um -> $(round(final_terminal_cm * 1e4; digits=3)) um")
     requested_growth_artery_seeds <= 0 &&
         println("Growth seed count set to all eligible XCAT artery paths.")
     println("Growth seeds: " * join([path.surface for path in growth_artery_paths], ", "))
     println("Seed proximal capacity diameters: " * join(["$(round(trees[name].root_diameter_cm * 10; digits=3)) mm" for name in growth_tree_names], ", "))
-    println("Target added branches: $(target_branches)")
+    println("Target added routed-growth branches: $(target_branches)")
     println("Per-seed branch caps: " * join(["$(name)=$(branch_caps[name])" for name in growth_tree_names], ", "))
     println("Coverage points: $(coverage_count)")
     println("Target demand mode: $(target_demand_mode)")
@@ -795,21 +831,20 @@ function main_right_leg_xcat_50um_gpu()
     println("Growth artery seed min length: $(round(growth_artery_min_length_cm * 10; digits=3)) mm")
     println("Fixed artery export min length: $(round(fixed_artery_min_length_cm * 10; digits=3)) mm")
     println("Fixed vein export min length: $(round(fixed_vein_min_length_cm * 10; digits=3)) mm")
-    println("Vessel-aware crop pad: $(crop_pad_voxels) voxel(s)")
-    println("Kept half: $(keep_desc) lower=$(lower_count) upper=$(upper_count)")
-    println("Cropped dims: $(size(target_mask)), muscle_foreground=$(count(mask)), muscle_labels=$(length(muscle_counts))")
-    println("Soft target mask foreground=$(count(target_mask)) target_labels=$(length(target_counts))")
-    println("Route tissue mask foreground=$(count(route_mask)) route_labels=$(length(route_labels)) dilation_voxels=$(route_dilation_voxels) fixed_vessel_radius_voxels=$(RIGHT_LEG_50UM_ROUTE_VESSEL_RADIUS_VOXELS)")
+    println("NRB domain voxel spacing: $(round(nrb_voxel_spacing_cm * 10; digits=3)) mm")
+    println("NRB domain samples per surface: $(nrb_domain_samples)")
+    println("NRB right-leg muscle surfaces: $(muscle_surface_count)")
+    println("NRB right-leg soft/route surfaces: $(route_surface_count)")
+    println("Target dims: $(size(target_mask)), target_foreground=$(count(target_mask)), target_surfaces=$(target_surface_count)")
+    println("Muscle mask foreground=$(count(mask)), muscle_surfaces=$(muscle_surface_count)")
+    println("Route tissue mask foreground=$(count(route_mask)) route_surfaces=$(route_surface_count) dilation_voxels=$(route_dilation_voxels) fixed_vessel_radius_voxels=$(RIGHT_LEG_50UM_ROUTE_VESSEL_RADIUS_VOXELS)")
     println("[artery paths] growth=$(length(growth_artery_paths)) fixed_non_growth=$(length(artery_overlay_paths)) fixed_total=$(length(fixed_artery_paths)) from $(length(artery_paths_all)) $(vessel_source) artery paths ($(length(artery_paths_near)) near-soft-target clipped paths)")
     println("[fixed veins] selected=$(length(vein_paths)) from $(length(vein_paths_all)) $(vessel_source) vein paths ($(length(vein_paths_near)) near-soft-target clipped paths)")
     println("[coverage] sampling $(coverage_count) random target points inside the target mask")
     flush(stdout)
 
-    coverage_points, target_demand_audit = random_points_in_mask_by_demand(
-        domain, raw_labels, xcat_info.dims, crop_lo, label_classes, coverage_count;
-        rng_seed=42,
-        demand_mode=target_demand_mode,
-        class_weights=target_demand_weights)
+    coverage_points = random_points_in_mask(domain, coverage_count; rng_seed=42)
+    target_demand_audit = nrb_target_audit(domain, coverage_count; class_name=target_tissue_mode == "muscle" ? "nrb_muscle_target" : "nrb_soft_target")
     write_target_demand_audit_csv(target_demand_audit_csv, target_demand_audit)
     graph_points = coverage_target_points_blockwise(route_domain; block_size=graph_block_size)
     println("[growth] coverage=$(size(coverage_points, 1)) graph=$(size(graph_points, 1)) frontier_batch=$(frontier_batch)")
@@ -819,7 +854,7 @@ function main_right_leg_xcat_50um_gpu()
         coverage_points_cm=coverage_points,
         graph_points_cm=graph_points,
         effective_supply_radius_cm=0.0,
-        capillary_diameter_cm=terminal_cm,
+        capillary_diameter_cm=growth_terminal_cm,
         max_new_branches_per_tree=branch_caps,
         graph_neighbors=graph_neighbors,
         min_frontier_separation_cm=min_frontier_separation_cm,
@@ -865,8 +900,16 @@ function main_right_leg_xcat_50um_gpu()
     stats = growth_stats["__global__"]
     route_repair_stats = Dict{String, NamedTuple}()
     for name in growth_tree_names
+        if final_terminal_cm < growth_terminal_cm
+            subdivide_terminals!(trees[name];
+                target_diameter_cm=final_terminal_cm,
+                gamma=3.0,
+                max_ld_ratio=subdivision_max_ld_ratio,
+                clip_below_diameter_cm=subdivision_clip_below_cm,
+                domain=route_domain)
+        end
         route_repair_stats[name] = repair_grown_segments_to_mask!(
-            trees[name], route_mask, origin_cm, xcat_info.spacing_cm;
+            trees[name], route_mask, route_origin_cm, route_spacing_cm;
             max_radius_voxels=2,
             max_passes=3)
     end
@@ -879,7 +922,7 @@ function main_right_leg_xcat_50um_gpu()
         restore_xcat_seed_diameters!(trees[name], [path])
     end
     tree = merge_growth_trees(RIGHT_LEG_50UM_TREE_NAME,
-        [trees[name] for name in growth_tree_names]; terminal_diameter_cm=terminal_cm)
+        [trees[name] for name in growth_tree_names]; terminal_diameter_cm=final_terminal_cm)
     artery_overlay_segments = append_fixed_overlays!(tree, artery_overlay_paths)
     vein_overlay_segments = append_vein_overlays!(tree, vein_paths)
 
@@ -912,13 +955,13 @@ function main_right_leg_xcat_50um_gpu()
     write_xcat_paths_csv(raw_artery_csv, fixed_artery_paths)
     write_xcat_paths_csv(raw_vein_csv, vein_paths)
     write_vessel_path_audit_csv(growth_artery_audit_csv, growth_artery_audit;
-        mask=route_mask, origin_cm=origin_cm, spacing_cm=xcat_info.spacing_cm,
+        mask=route_mask, origin_cm=route_origin_cm, spacing_cm=route_spacing_cm,
         paths=fixed_artery_paths)
     write_vessel_path_audit_csv(fixed_artery_audit_csv, fixed_artery_audit;
-        mask=route_mask, origin_cm=origin_cm, spacing_cm=xcat_info.spacing_cm,
+        mask=route_mask, origin_cm=route_origin_cm, spacing_cm=route_spacing_cm,
         paths=oriented_artery_paths_near)
     write_vessel_path_audit_csv(vein_audit_csv, vein_audit;
-        mask=route_mask, origin_cm=origin_cm, spacing_cm=xcat_info.spacing_cm,
+        mask=route_mask, origin_cm=route_origin_cm, spacing_cm=route_spacing_cm,
         paths=vein_paths_near)
     write_right_leg_full_summary(summary_path, raw_path, organ_ids_path, log_path,
         xcat_info, keep_desc, (lower_count, upper_count), crop_lo, crop_hi,
@@ -935,8 +978,8 @@ function main_right_leg_xcat_50um_gpu()
         flow_explicit_min_diameter_um=flow_explicit_min_diameter_um,
         crop_pad_voxels=crop_pad_voxels,
         muscle_tissue_voxels=count(mask),
-        muscle_label_count=length(muscle_counts),
-        target_label_count=length(target_counts),
+        muscle_label_count=muscle_surface_count,
+        target_label_count=target_surface_count,
         growth_artery_count=growth_artery_count,
         growth_artery_min_length_cm=growth_artery_min_length_cm,
         fixed_artery_min_length_cm=fixed_artery_min_length_cm,

@@ -431,6 +431,116 @@ function nrb_group_seed_paths(nrb_path::AbstractString, log_info, group_name::Ab
     return paths
 end
 
+function nrb_centerline_to_seed_paths(centerline::XCATCenterline;
+                                      coordinate_scale::Float64=0.1,
+                                      label_prefix::String="",
+                                      max_step_cm::Float64=2.5,
+                                      min_points::Int=2)
+    paths = XCATSeedPath[]
+    run_points = SVector{3, Float64}[]
+    run_diameters = Float64[]
+    run_indices = Int[]
+    part = 1
+
+    function flush_run!()
+        if length(run_points) >= min_points
+            label = isempty(label_prefix) ? centerline.name : string(label_prefix, centerline.name)
+            if part > 1
+                label *= "_part$(part)"
+            end
+            push!(paths, XCATSeedPath(label, copy(run_indices), copy(run_points), copy(run_diameters)))
+            part += 1
+        end
+        empty!(run_points)
+        empty!(run_diameters)
+        empty!(run_indices)
+        return nothing
+    end
+
+    for (idx, p_mm) in enumerate(centerline.centers)
+        p_cm = coordinate_scale .* p_mm
+        diameter_cm = 2.0 * coordinate_scale * centerline.radii[idx]
+        if !isempty(run_points) && norm(p_cm - last(run_points)) > max_step_cm
+            flush_run!()
+        end
+        push!(run_points, p_cm)
+        push!(run_diameters, diameter_cm)
+        push!(run_indices, idx)
+    end
+    flush_run!()
+    return paths
+end
+
+function nrb_group_seed_paths_from_surfaces(surfaces::AbstractVector{XCATNurbsSurface},
+                                            group_name::AbstractString;
+                                            coordinate_scale::Float64=0.1,
+                                            label_prefix::String="",
+                                            circumferential_samples::Int=64,
+                                            max_step_cm::Float64=2.5)
+    group_surfaces = [surface for surface in surfaces if xcat_group_name(surface) == group_name]
+    !isempty(group_surfaces) || error("No `$group_name` surfaces found in XCAT NRB")
+    paths = XCATSeedPath[]
+    for surface in group_surfaces
+        centerline = xcat_centerline_from_surface(surface; circumferential_samples=circumferential_samples)
+        append!(paths, nrb_centerline_to_seed_paths(centerline;
+            coordinate_scale=coordinate_scale,
+            label_prefix=label_prefix,
+            max_step_cm=max_step_cm))
+    end
+    !isempty(paths) || error("No usable `$group_name` NRB centerline paths were extracted")
+    return paths
+end
+
+function nrb_bounds(surfaces::AbstractVector{XCATNurbsSurface})
+    lo = SVector(Inf, Inf, Inf)
+    hi = SVector(-Inf, -Inf, -Inf)
+    for surface in surfaces
+        slo, shi = xcat_bounds(surface)
+        lo = min.(lo, slo)
+        hi = max.(hi, shi)
+    end
+    return lo, hi
+end
+
+function bbox_intersects(lo_a, hi_a, lo_b, hi_b; margin_mm::Float64=0.0)
+    return all((hi_a .+ margin_mm) .>= lo_b) && all((hi_b .+ margin_mm) .>= lo_a)
+end
+
+function bbox_center(lo, hi)
+    return 0.5 .* (lo .+ hi)
+end
+
+function right_leg_nrb_soft_surfaces(surfaces::AbstractVector{XCATNurbsSurface})
+    selected = XCATNurbsSurface[]
+    for surface in surfaces
+        group = lowercase(xcat_group_name(surface))
+        if group == "leg_right" || startswith(group, "foot_right")
+            push!(selected, surface)
+        end
+    end
+    !isempty(selected) || error("No right-leg soft envelope surfaces (`leg_right`/`foot_right*`) found in XCAT NRB")
+    return selected
+end
+
+function right_leg_nrb_muscle_surfaces(surfaces::AbstractVector{XCATNurbsSurface},
+                                       soft_surfaces::AbstractVector{XCATNurbsSurface};
+                                       margin_mm::Float64=12.0)
+    soft_lo, soft_hi = nrb_bounds(soft_surfaces)
+    selected = XCATNurbsSurface[]
+    for surface in surfaces
+        group = lowercase(xcat_group_name(surface))
+        is_muscle = startswith(group, "musc") || group == "rfoot_musc"
+        is_muscle || continue
+        slo, shi = xcat_bounds(surface)
+        center = bbox_center(slo, shi)
+        center_inside = all(center .>= (soft_lo .- margin_mm)) && all(center .<= (soft_hi .+ margin_mm))
+        center_inside || continue
+        push!(selected, surface)
+    end
+    !isempty(selected) || error("No right-leg muscle surfaces were selected from the XCAT NRB")
+    return selected
+end
+
 function path_length_cm(path::XCATSeedPath)
     return sum(norm(path.points[i] - path.points[i - 1]) for i in 2:length(path.points))
 end
