@@ -758,7 +758,10 @@ function main_right_leg_xcat_50um_gpu()
     root_diameters = [trees[name].root_diameter_cm for name in growth_tree_names]
     capacity_weights = Dict(name => artery_weight(path) for (name, path) in zip(growth_tree_names, growth_artery_paths))
     territory_distance_weights = Dict(name => proximal_root_diameter_cm(path) for (name, path) in zip(growth_tree_names, growth_artery_paths))
-    subdivision_factor = final_terminal_cm < growth_terminal_cm ? max(1, ceil(Int, (growth_terminal_cm / final_terminal_cm)^3)) : 1
+    # Subdivision is a symmetric binary bifurcation (gamma=3): each growth terminal
+    # yields 2^(ceil(3*log2(growth/final)) - 1) leaves, NOT the continuous (growth/final)^3.
+    # Use the actual binary leaf count so target_branches back-computes to the requested total.
+    subdivision_factor = final_terminal_cm < growth_terminal_cm ? 2 ^ max(0, ceil(Int, 3 * log2(growth_terminal_cm / final_terminal_cm)) - 1) : 1
     target_branches = lowercase(target_arg) == "auto" ?
         ceil(Int, (maximum(root_diameters) / growth_terminal_cm)^3) :
         max(1, ceil(Int, parse(Int, target_arg) / subdivision_factor))
@@ -906,6 +909,7 @@ function main_right_leg_xcat_50um_gpu()
                 gamma=3.0,
                 max_ld_ratio=subdivision_max_ld_ratio,
                 clip_below_diameter_cm=subdivision_clip_below_cm,
+                skip_xcat=true,
                 domain=route_domain)
         end
         route_repair_stats[name] = repair_grown_segments_to_mask!(

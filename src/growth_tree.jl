@@ -502,6 +502,7 @@ function subdivide_terminals!(tree::GrowthTree;
         ld_ratio::Float64=12.0,
         max_ld_ratio::Float64=25.0,
         clip_below_diameter_cm::Float64=0.0,
+        skip_xcat::Bool=false,
         domain::Union{Nothing, VoxelShellDomain}=nothing)
 
     target_diameter_cm >= tree.terminal_diameter_cm && return nothing
@@ -515,6 +516,9 @@ function subdivide_terminals!(tree::GrowthTree;
     for tip_v in terminals
         seg = tree.incoming_segment[tip_v]
         seg == 0 && continue
+        # Skip real XCAT artery tips (e.g. femoral distal end): subdividing a mm-scale
+        # seed terminal would sprout a fake symmetric capillary fan off a major artery.
+        skip_xcat && tree.is_xcat[seg] && continue
         d_cm = tree.segment_diameter_cm[seg]
         d_cm <= target_diameter_cm && continue
 
