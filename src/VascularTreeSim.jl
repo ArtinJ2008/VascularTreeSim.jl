@@ -27,6 +27,7 @@ using Printf
 using LinearAlgebra
 using StaticArrays
 using Statistics
+using Serialization
 using TOML
 import Base.Threads
 
@@ -42,6 +43,7 @@ include("graph_routing.jl")
 include("growth_engine.jl")
 include("phantom_extraction.jl")
 include("csv_io.jl")
+include("flow_export.jl")
 include("viewer.jl")
 include("voxelizer.jl")
 
@@ -116,6 +118,12 @@ export voxelize_trees,
 
 # ── I/O & Visualization ──
 export write_growth_csv,
+       write_arterial_growth_csv,
+       write_flow_topology_audit_csv,
+       write_terminal_path_audit_csv,
+       write_root_territory_audit_csv,
+       write_diameter_order_audit_csv,
+       write_hemodynamic_tree_csv,
        growth_viewer_html,
        domain_check_html
 

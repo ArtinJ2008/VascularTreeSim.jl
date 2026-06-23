@@ -6,6 +6,7 @@ using LinearAlgebra
 using Random
 
 @testset "VascularTreeSim.jl" begin
+    include("test_flow_exports.jl")
     include("test_cube_shell.jl")
     include("test_sphere_shell.jl")
     include("test_cylinder.jl")

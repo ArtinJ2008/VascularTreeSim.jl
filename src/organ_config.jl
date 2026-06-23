@@ -59,6 +59,14 @@ struct OrganConfig
     turn_penalty::Float64
     target_p95_distance_cm::Float64
     target_max_distance_cm::Float64
+    hydraulic_cost_weight::Float64
+    hydraulic_rank_candidate_factor::Int
+    hydraulic_reference_length_cm::Float64
+    hydraulic_existing_path_weight::Float64
+    min_hydraulic_score_cm::Float64
+    max_new_branch_resistance_rel::Float64
+    max_terminal_path_resistance_rel::Float64
+    blood_viscosity_poise::Float64
 
     # Seed points (for :seed_point mode)
     seed_points::Dict{String, SVector{3,Float64}}
@@ -129,6 +137,14 @@ function load_organ_config(path::AbstractString)
     turn_penalty = get(gr, "turn_penalty", 0.5)
     target_p95_distance_cm = get(gr, "target_p95_distance_cm", Inf)
     target_max_distance_cm = get(gr, "target_max_distance_cm", Inf)
+    hydraulic_cost_weight = get(gr, "hydraulic_cost_weight", 0.0)
+    hydraulic_rank_candidate_factor = get(gr, "hydraulic_rank_candidate_factor", 0)
+    hydraulic_reference_length_cm = get(gr, "hydraulic_reference_length_cm", 1.0)
+    hydraulic_existing_path_weight = get(gr, "hydraulic_existing_path_weight", 0.0)
+    min_hydraulic_score_cm = get(gr, "min_hydraulic_score_cm", 0.0)
+    max_new_branch_resistance_rel = get(gr, "max_new_branch_resistance_rel", Inf)
+    max_terminal_path_resistance_rel = get(gr, "max_terminal_path_resistance_rel", Inf)
+    blood_viscosity_poise = get(gr, "blood_viscosity_poise", 0.035)
 
     seed_points = Dict{String, SVector{3,Float64}}()
     if haskey(cfg, "seed_points")
@@ -148,6 +164,9 @@ function load_organ_config(path::AbstractString)
         max_path_nodes, frontier_batch, murray_gamma, max_segment_length_cm,
         smooth_passes, spline_density, coverage_stride, graph_stride, graph_jitter_cm, turn_penalty,
         target_p95_distance_cm, target_max_distance_cm,
+        hydraulic_cost_weight, hydraulic_rank_candidate_factor, hydraulic_reference_length_cm, hydraulic_existing_path_weight,
+        min_hydraulic_score_cm, max_new_branch_resistance_rel, max_terminal_path_resistance_rel,
+        blood_viscosity_poise,
         seed_points,
     )
 end

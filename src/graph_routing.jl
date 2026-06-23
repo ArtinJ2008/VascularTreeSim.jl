@@ -120,6 +120,61 @@ function _path_edges_stay_in_domain(domain, points::Vector{SVector{3, Float64}})
     return true
 end
 
+function _domain_valid_neighbors(points::Vector{SVector{3, Float64}},
+                                 candidates::Vector{Int},
+                                 i::Int,
+                                 k::Int,
+                                 domain)
+    pivot = points[i]
+    valid = Tuple{Float64, Int}[]
+    seen = Set{Int}()
+    sizehint!(valid, k)
+    for j in candidates
+        (j == i || j in seen) && continue
+        push!(seen, j)
+        _edge_stays_in_domain(domain, pivot, points[j]) || continue
+        push!(valid, (norm(points[j] - pivot), j))
+    end
+    sort!(valid, by=first)
+    return valid[1:min(k, length(valid))]
+end
+
+function _sample_domain_neighbors_grid(points::Vector{SVector{3, Float64}},
+                                       grid::PointCloudGrid,
+                                       i::Int,
+                                       k::Int,
+                                       domain;
+                                       initial_rings::Int=4,
+                                       brute_force_limit::Int=100_000)
+    n = length(points)
+    n <= 1 && return Tuple{Float64, Int}[]
+
+    max_possible_rings = max(grid.dims[1], grid.dims[2], grid.dims[3])
+    rings = min(max(initial_rings, 0), max_possible_rings)
+    candidate_goal = min(n, max(32, 8 * k))
+    best = Tuple{Float64, Int}[]
+
+    while true
+        pivot = points[i]
+        candidates = _surface_candidates(grid, (pivot[1], pivot[2], pivot[3]);
+            max_rings=rings,
+            min_candidates=candidate_goal)
+        best = _domain_valid_neighbors(points, candidates, i, k, domain)
+        length(best) >= k && return best
+        rings >= max_possible_rings && break
+        candidate_goal = min(n, max(candidate_goal * 2, candidate_goal + 8 * k))
+        rings = min(max_possible_rings, max(rings * 2, rings + 1))
+    end
+
+    # Exhaustive fallback keeps small validation domains robust while avoiding
+    # accidental O(N^2) graph builds for anatomy volumes with millions of route
+    # points.
+    if length(best) < k && n <= brute_force_limit
+        best = _domain_valid_neighbors(points, collect(1:n), i, k, domain)
+    end
+    return best
+end
+
 function build_domain_graph(points_cm::Matrix{Float64}, domain; k::Int=10)
     pts = [SVector(points_cm[i, 1], points_cm[i, 2], points_cm[i, 3]) for i in axes(points_cm, 1)]
     point_matrix = Matrix{Float64}(undef, length(pts), 3)
@@ -147,8 +202,7 @@ function build_domain_graph(points_cm::Matrix{Float64}, domain; k::Int=10)
     Threads.@threads for i in 1:n
         local_neighbors = Int[]
         local_costs = Float64[]
-        for (d, j) in _sample_k_nearest_grid(pts, grid, i, k)
-            _edge_stays_in_domain(domain, pts[i], pts[j]) || continue
+        for (d, j) in _sample_domain_neighbors_grid(pts, grid, i, k, domain)
             mid = 0.5 .* (pts[i] + pts[j])
             base_cost = d * shell_midwall_cost(domain, (mid[1], mid[2], mid[3]))
             push!(local_neighbors, j)

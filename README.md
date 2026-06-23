@@ -243,6 +243,14 @@ graph_jitter_cm = 0.08                     # break grid alignment
 turn_penalty = 0.5                         # Dijkstra cost of changing direction
 target_p95_distance_cm = 0.005             # stop when this is met
 target_max_distance_cm = 0.01
+hydraulic_cost_weight = 0.0                # 0 keeps pure coverage ordering
+hydraulic_rank_candidate_factor = 0        # >0 ranks extra frontier candidates by flow-aware score
+hydraulic_reference_length_cm = 1.0        # resistance normalization length
+hydraulic_existing_path_weight = 0.0       # include upstream path in soft cost
+min_hydraulic_score_cm = 0.0               # reject if coverage benefit/cost is below this
+max_new_branch_resistance_rel = inf        # optional hard cap vs reference vessel
+max_terminal_path_resistance_rel = inf     # optional hard cap including upstream path
+blood_viscosity_poise = 0.035              # 3.5 cP
 ```
 
 `[seed_points]` is only consulted when `growth.mode = "seed_point"`.
@@ -270,6 +278,11 @@ from coordinate coincidence. Dense subdivided trees pack vertices tightly
 enough (~100 M end-points in 60 g of myocardium) that 10 nm coordinate
 rounding can collapse unrelated endpoints; FlowContrastSim handles this by
 following the parent-id chain.
+
+Flow audit CSVs report both raw `generation` and `branchpoint_generation`.
+`generation` counts every geometry row, including degree-2 polyline samples
+used to trace a curved vessel. `branchpoint_generation` increments only at
+actual branchpoints, so it is the safer number for physiological depth checks.
 
 ---
 

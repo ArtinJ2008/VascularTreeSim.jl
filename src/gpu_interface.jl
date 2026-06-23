@@ -33,6 +33,9 @@ gpu_available() = _gpu_backend[] != :cpu
 """Initialize GPU state: upload coverage points to device memory."""
 function _gpu_init_distance_state end
 
+"""Upload graph-component reachability masks used by GPU distance kernels."""
+function _gpu_set_component_reachability! end
+
 """Compute min distance from all points to all segments of a tree on GPU."""
 function _gpu_full_distance_scan! end
 

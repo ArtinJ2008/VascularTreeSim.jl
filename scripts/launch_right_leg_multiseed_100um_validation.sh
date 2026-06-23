@@ -15,6 +15,8 @@ cd "${REPO}"
 export JULIA_DEPOT_PATH="/media/molloi-lab/2TB4/Artin/julia_depot"
 export CUDA_DEVICE_ORDER="PCI_BUS_ID"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-2}"
+export VTS_XCAT_NRB_PATH="${VTS_XCAT_NRB_PATH:-${INPUT}/both_legs_1.nrb}"
+export VTS_XCAT_VESSEL_SOURCE="${VTS_XCAT_VESSEL_SOURCE:-nrb}"
 
 exec /home/molloi-lab/.juliaup/bin/julia --project=. \
     examples/right_leg_xcat_50um_gpu.jl \

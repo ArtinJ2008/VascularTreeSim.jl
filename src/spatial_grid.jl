@@ -60,6 +60,7 @@ function _surface_candidates(grid::PointCloudGrid, point; max_rings::Int=2, min_
                 iy = cy + dy
                 (iy < 1 || iy > grid.dims[2]) && continue
                 for dx in -ring:ring
+                    max(abs(dx), abs(dy), abs(dz)) == ring || continue
                     ix = cx + dx
                     (ix < 1 || ix > grid.dims[1]) && continue
                     idx = ix + (iy - 1) * grid.dims[1] + (iz - 1) * grid.dims[1] * grid.dims[2]

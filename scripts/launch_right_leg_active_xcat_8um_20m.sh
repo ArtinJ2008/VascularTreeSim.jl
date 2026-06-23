@@ -5,16 +5,21 @@ WORK_ROOT="/media/molloi-lab/2TB4/Artin/right_leg_corrected_50um_full_20260615_1
 REPO="${WORK_ROOT}/repo/VascularTreeSim.jl"
 INPUT="${WORK_ROOT}/input/both_legs_xcat_input"
 STAMP="$(date +%Y%m%d_%H%M%S)"
-OUT="${WORK_ROOT}/output/right_leg_active_xcat_30um_full_${STAMP}"
+OUT="${WORK_ROOT}/output/right_leg_active_xcat_8um_20m_${STAMP}"
 LOG_DIR="${WORK_ROOT}/logs"
-LOG="${LOG_DIR}/right_leg_active_xcat_30um_full_${STAMP}.log"
+LOG="${LOG_DIR}/right_leg_active_xcat_8um_20m_${STAMP}.log"
 
 mkdir -p "${OUT}" "${LOG_DIR}"
 cd "${REPO}"
 
 export JULIA_DEPOT_PATH="/media/molloi-lab/2TB4/Artin/julia_depot"
+export JULIA_NUM_THREADS="${JULIA_NUM_THREADS:-16}"
 export CUDA_DEVICE_ORDER="PCI_BUS_ID"
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-2}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
+export VTS_CHECKPOINT_DIR="${OUT}/checkpoints"
+export VTS_CHECKPOINT_INTERVAL_SECONDS="${VTS_CHECKPOINT_INTERVAL_SECONDS:-14400}"
+export VTS_CHECKPOINT_KEEP="${VTS_CHECKPOINT_KEEP:-2}"
+export VTS_ROUTE_DILATION_VOXELS="${VTS_ROUTE_DILATION_VOXELS:-0}"
 export VTS_MAX_GRAPH_BLOCK_SIZE="${VTS_MAX_GRAPH_BLOCK_SIZE:-1}"
 export VTS_TARGET_TISSUE_MODE="${VTS_TARGET_TISSUE_MODE:-soft}"
 export VTS_TARGET_DEMAND_MODE="${VTS_TARGET_DEMAND_MODE:-uniform}"
@@ -34,7 +39,7 @@ export VTS_XCAT_NRB_PATH="${VTS_XCAT_NRB_PATH:-${INPUT}/both_legs_1.nrb}"
 export VTS_XCAT_VESSEL_SOURCE="${VTS_XCAT_VESSEL_SOURCE:-nrb}"
 
 {
-    echo "run=right_leg_active_xcat_30um_full"
+    echo "run=right_leg_active_xcat_8um_20m"
     echo "started=$(date --iso-8601=seconds)"
     echo "repo=${REPO}"
     echo "input=${INPUT}"
@@ -42,14 +47,31 @@ export VTS_XCAT_VESSEL_SOURCE="${VTS_XCAT_VESSEL_SOURCE:-nrb}"
     echo "xcat_vessel_source=${VTS_XCAT_VESSEL_SOURCE}"
     echo "output=${OUT}"
     echo "log=${LOG}"
+    echo "julia_num_threads=${JULIA_NUM_THREADS}"
     echo "cuda_visible_devices=${CUDA_VISIBLE_DEVICES}"
-    echo "terminal_um=30.0"
-    echo "target=auto"
+    echo "terminal_um=8.0"
+    echo "target=20000000"
     echo "frontier_batch=4096"
     echo "graph_block_size=1"
-    echo "max_graph_block_size=${VTS_MAX_GRAPH_BLOCK_SIZE}"
+    echo "min_frontier_separation_cm=0.01"
     echo "max_segment_length_cm=0.05"
-    echo "route_dilation_voxels=0"
+    echo "graph_neighbors=24"
+    echo "max_path_nodes=48"
+    echo "graph_jitter_cm=0.005"
+    echo "snap_terminal_to_target=true"
+    echo "max_terminal_snap_cm=0.15"
+    echo "coverage_multiplier=1.10"
+    echo "use_indexed_anchor=true"
+    echo "use_astar_routing=true"
+    echo "frontier_candidate_factor=32"
+    echo "fixed_vein_exports=6"
+    echo "max_anchor_gap_cm=1.25"
+    echo "growth_artery_seeds=0"
+    echo "growth_artery_min_length_cm=3.0"
+    echo "fixed_artery_min_length_cm=3.0"
+    echo "fixed_vein_min_length_cm=8.0"
+    echo "route_dilation_voxels=${VTS_ROUTE_DILATION_VOXELS}"
+    echo "max_graph_block_size=${VTS_MAX_GRAPH_BLOCK_SIZE}"
     echo "target_tissue_mode=${VTS_TARGET_TISSUE_MODE}"
     echo "target_demand_mode=${VTS_TARGET_DEMAND_MODE}"
     echo "target_demand_weights=${VTS_TARGET_DEMAND_WEIGHTS}"
@@ -64,18 +86,19 @@ export VTS_XCAT_VESSEL_SOURCE="${VTS_XCAT_VESSEL_SOURCE:-nrb}"
     echo "max_new_branch_resistance_rel=${VTS_MAX_NEW_BRANCH_RESISTANCE_REL}"
     echo "max_terminal_path_resistance_rel=${VTS_MAX_TERMINAL_PATH_RESISTANCE_REL}"
     echo "blood_viscosity_poise=${VTS_BLOOD_VISCOSITY_POISE}"
-    echo "fixed_vein_exports=6"
-    echo "main_xcat_artery_seeds=all eligible"
+    echo "checkpoint_dir=${VTS_CHECKPOINT_DIR}"
+    echo "checkpoint_interval_seconds=${VTS_CHECKPOINT_INTERVAL_SECONDS}"
+    echo "checkpoint_keep=${VTS_CHECKPOINT_KEEP}"
 } > "${OUT}/run_metadata.txt"
 
 exec /home/molloi-lab/.juliaup/bin/julia --project=. \
     examples/right_leg_xcat_50um_gpu.jl \
-    30.0 \
+    8.0 \
     "${OUT}" \
     "${INPUT}/both_legs_act_1.raw" \
     "${INPUT}/organ_ids.txt" \
     "${INPUT}/both_legs_log" \
-    auto \
+    20000000 \
     4096 \
     1 \
     0.01 \
@@ -92,4 +115,7 @@ exec /home/molloi-lab/.juliaup/bin/julia --project=. \
     6 \
     1.25 \
     0 \
+    3.0 \
+    3.0 \
+    8.0 \
     > "${LOG}" 2>&1

@@ -2,8 +2,8 @@
     right_leg_xcat_trial.jl
 
 Build a right-leg muscle mask from a both-legs XCAT color-code RAW volume,
-seed growth from XCAT right-leg artery centerlines, overlay the main XCAT
-right-leg veins after growth, and write the rich femoral viewer.
+seed growth from XCAT right-leg NRB artery centerlines, overlay the main XCAT
+right-leg NRB veins after growth, and write the rich femoral viewer.
 
 Usage:
     julia --project=. examples/right_leg_xcat_trial.jl [max_branches] [terminal_um] [output_dir] [input_dir] [geometry_dir] [block_size] [main_veins]
@@ -23,6 +23,7 @@ const RIGHT_LEG_TRIAL_DEFAULT_GEOMETRY_DIR = raw"D:\UCI\Vessel Prediction\New Ou
 const RIGHT_LEG_TRIAL_DEFAULT_OUTPUT_DIR = joinpath(dirname(@__DIR__), "output", "xcat_right_leg_trial_100um")
 const RIGHT_LEG_TRIAL_TREE_NAME = "XCATRightLegTrial"
 const MAX_FIXED_VESSEL_DISTANCE_TO_MUSCLE_CM = 1.25
+const XCAT_NRB_Z_REFERENCE_CM = 100.0
 
 function right_leg_muscle_labels(name_to_labels)
     labels = UInt16[]
@@ -351,6 +352,82 @@ function load_xcat_paths_from_raw_segments(path::AbstractString; label_prefix::S
         label = isempty(label_prefix) ? surface : string(label_prefix, surface)
         push!(paths, XCATSeedPath(label, indices, points, diameters))
     end
+    return paths
+end
+
+function xcat_nrb_mm_to_raw_cm(p::SVector{3, Float64}, log_info)
+    x_cm = 0.1 * p[1] + 0.5 * log_info.dims[1] * log_info.spacing_cm[1]
+    y_cm = 0.1 * p[2] + 0.5 * log_info.dims[2] * log_info.spacing_cm[2]
+    z_cm = (XCAT_NRB_Z_REFERENCE_CM - 0.1 * p[3]) - log_info.start_slice * log_info.spacing_cm[3]
+    return SVector(x_cm, y_cm, z_cm)
+end
+
+function point_inside_raw_volume_cm(point::SVector{3, Float64}, log_info)
+    hi = SVector(
+        log_info.dims[1] * log_info.spacing_cm[1],
+        log_info.dims[2] * log_info.spacing_cm[2],
+        log_info.dims[3] * log_info.spacing_cm[3],
+    )
+    return all(point .>= SVector(0.0, 0.0, 0.0)) && all(point .<= hi)
+end
+
+function centerline_to_raw_seed_paths(centerline::XCATCenterline, log_info;
+                                      label_prefix::String="",
+                                      max_step_cm::Float64=2.5,
+                                      min_points::Int=2)
+    paths = XCATSeedPath[]
+    run_points = SVector{3, Float64}[]
+    run_diameters = Float64[]
+    run_indices = Int[]
+    part = 1
+
+    function flush_run!()
+        if length(run_points) >= min_points
+            label = isempty(label_prefix) ? centerline.name : string(label_prefix, centerline.name)
+            if part > 1
+                label *= "_part$(part)"
+            end
+            push!(paths, XCATSeedPath(label, copy(run_indices), copy(run_points), copy(run_diameters)))
+            part += 1
+        end
+        empty!(run_points)
+        empty!(run_diameters)
+        empty!(run_indices)
+        return nothing
+    end
+
+    for (idx, p_mm) in enumerate(centerline.centers)
+        p_cm = xcat_nrb_mm_to_raw_cm(p_mm, log_info)
+        diameter_cm = 0.2 * centerline.radii[idx]
+        inside = point_inside_raw_volume_cm(p_cm, log_info)
+        too_far = !isempty(run_points) && norm(p_cm - last(run_points)) > max_step_cm
+        if !inside || too_far
+            flush_run!()
+        end
+        inside || continue
+        push!(run_points, p_cm)
+        push!(run_diameters, diameter_cm)
+        push!(run_indices, idx)
+    end
+    flush_run!()
+    return paths
+end
+
+function nrb_group_seed_paths(nrb_path::AbstractString, log_info, group_name::AbstractString;
+                              label_prefix::String="",
+                              circumferential_samples::Int=64,
+                              max_step_cm::Float64=2.5)
+    isfile(nrb_path) || error("Missing XCAT NRB file for vessel centerlines: $nrb_path")
+    surfaces = parse_xcat_grouped_nrb(nrb_path)
+    group_surfaces = [surface for surface in surfaces if xcat_group_name(surface) == group_name]
+    !isempty(group_surfaces) || error("No `$group_name` surfaces found in XCAT NRB: $nrb_path")
+    paths = XCATSeedPath[]
+    for surface in group_surfaces
+        centerline = xcat_centerline_from_surface(surface; circumferential_samples=circumferential_samples)
+        append!(paths, centerline_to_raw_seed_paths(centerline, log_info;
+            label_prefix=label_prefix, max_step_cm=max_step_cm))
+    end
+    !isempty(paths) || error("No usable `$group_name` NRB centerline points were inside the raw volume")
     return paths
 end
 

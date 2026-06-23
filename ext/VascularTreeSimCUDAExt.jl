@@ -27,6 +27,13 @@ mutable struct GPUDistanceState
     # Persistent distance/ownership state
     d_min_dist::CuVector{Float64}
     d_owner::CuVector{Int32}
+    # Optional component reachability state. When enabled, kernels ignore
+    # target points whose route-graph component is not reachable from the
+    # active tree seed.
+    d_point_component::CuVector{Int32}
+    d_tree_component_allowed::CuVector{UInt8}
+    n_components::Int32
+    reachability_enabled::Bool
     n_points::Int
 end
 
@@ -38,8 +45,10 @@ Each thread = one point, iterates over ALL n_segs segments.
 """
 function _kernel_min_seg_dist!(min_dist, owner,
                                 px, py, pz,
+                                point_component, tree_component_allowed,
                                 ax, ay, az, bx, by, bz,
-                                n_segs::Int32, tree_idx::Int32, inv_weight::Float64)
+                                n_segs::Int32, tree_idx::Int32, inv_weight::Float64,
+                                n_components::Int32, reachability_enabled::Bool)
     # min_dist stores EFFECTIVE distance = raw * (1/weight_owner); see
     # growth_engine.jl comment. `inv_weight` here is 1/weight of the tree being
     # added. A larger weight (smaller inv_weight) shrinks the effective
@@ -47,6 +56,12 @@ function _kernel_min_seg_dist!(min_dist, owner,
     # (in raw distance) than a unit-weight competitor.
     i = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x
     i > length(px) && return nothing
+    if reachability_enabled
+        comp = @inbounds point_component[i]
+        comp <= 0 && return nothing
+        allowed_idx = comp + (tree_idx - Int32(1)) * n_components
+        @inbounds tree_component_allowed[allowed_idx] == UInt8(0) && return nothing
+    end
 
     best_d2 = Inf
 
@@ -87,11 +102,19 @@ Incremental kernel — only processes segments in range [seg_start, seg_end].
 """
 function _kernel_min_seg_dist_range!(min_dist, owner,
                                       px, py, pz,
+                                      point_component, tree_component_allowed,
                                       ax, ay, az, bx, by, bz,
                                       seg_start::Int32, seg_end::Int32, tree_idx::Int32,
-                                      inv_weight::Float64)
+                                      inv_weight::Float64, n_components::Int32,
+                                      reachability_enabled::Bool)
     i = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x
     i > length(px) && return nothing
+    if reachability_enabled
+        comp = @inbounds point_component[i]
+        comp <= 0 && return nothing
+        allowed_idx = comp + (tree_idx - Int32(1)) * n_components
+        @inbounds tree_component_allowed[allowed_idx] == UInt8(0) && return nothing
+    end
 
     best_d = @inbounds min_dist[i]
     best_owner = @inbounds owner[i]
@@ -134,10 +157,18 @@ Seed tree kernel — distance from all points to a single root vertex.
 """
 function _kernel_seed_dist!(min_dist, owner,
                              px, py, pz,
+                             point_component, tree_component_allowed,
                              rx::Float64, ry::Float64, rz::Float64,
-                             tree_idx::Int32, inv_weight::Float64)
+                             tree_idx::Int32, inv_weight::Float64,
+                             n_components::Int32, reachability_enabled::Bool)
     i = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x
     i > length(px) && return nothing
+    if reachability_enabled
+        comp = @inbounds point_component[i]
+        comp <= 0 && return nothing
+        allowed_idx = comp + (tree_idx - Int32(1)) * n_components
+        @inbounds tree_component_allowed[allowed_idx] == UInt8(0) && return nothing
+    end
 
     @inbounds begin
         dx = px[i] - rx
@@ -171,9 +202,37 @@ function VascularTreeSim._gpu_init_distance_state(points_cm::Matrix{Float64})
     d_pz = CuArray(points_cm[:, 3])
     d_min_dist = CUDA.fill(Inf, n)
     d_owner = CUDA.zeros(Int32, n)
+    d_point_component = CuArray(Int32[0])
+    d_tree_component_allowed = CuArray(UInt8[0])
     println("[GPU] initialized: $(n) points on $(CUDA.name(CUDA.device()))")
     flush(stdout)
-    return GPUDistanceState(d_px, d_py, d_pz, d_min_dist, d_owner, n)
+    return GPUDistanceState(d_px, d_py, d_pz, d_min_dist, d_owner,
+        d_point_component, d_tree_component_allowed, Int32(0), false, n)
+end
+
+function VascularTreeSim._gpu_set_component_reachability!(state::GPUDistanceState,
+                                                          point_components::Vector{Int},
+                                                          tree_components::Vector{Set{Int}},
+                                                          n_components::Int)
+    n_components <= 0 && return nothing
+    n_trees = length(tree_components)
+    allowed = zeros(UInt8, n_components * n_trees)
+    for ti in 1:n_trees
+        offset = (ti - 1) * n_components
+        for comp in tree_components[ti]
+            1 <= comp <= n_components || continue
+            allowed[offset + comp] = UInt8(1)
+        end
+    end
+    CUDA.unsafe_free!(state.d_point_component)
+    CUDA.unsafe_free!(state.d_tree_component_allowed)
+    state.d_point_component = CuArray(Int32.(point_components))
+    state.d_tree_component_allowed = CuArray(allowed)
+    state.n_components = Int32(n_components)
+    state.reachability_enabled = true
+    println("[GPU] component reachability uploaded: $(n_components) components, $(n_trees) trees")
+    flush(stdout)
+    return nothing
 end
 
 function VascularTreeSim._gpu_full_distance_scan!(state::GPUDistanceState,
@@ -194,8 +253,10 @@ function VascularTreeSim._gpu_full_distance_scan!(state::GPUDistanceState,
     @cuda threads=threads blocks=blocks _kernel_min_seg_dist!(
         state.d_min_dist, state.d_owner,
         state.d_px, state.d_py, state.d_pz,
+        state.d_point_component, state.d_tree_component_allowed,
         d_ax, d_ay, d_az, d_bx, d_by, d_bz,
-        Int32(nseg), Int32(tree_idx), 1.0 / weight)
+        Int32(nseg), Int32(tree_idx), 1.0 / weight,
+        state.n_components, state.reachability_enabled)
     CUDA.synchronize()
 
     CUDA.unsafe_free!(d_ax); CUDA.unsafe_free!(d_ay); CUDA.unsafe_free!(d_az)
@@ -211,8 +272,10 @@ function VascularTreeSim._gpu_seed_distance!(state::GPUDistanceState,
     @cuda threads=threads blocks=blocks _kernel_seed_dist!(
         state.d_min_dist, state.d_owner,
         state.d_px, state.d_py, state.d_pz,
+        state.d_point_component, state.d_tree_component_allowed,
         root_vertex[1], root_vertex[2], root_vertex[3],
-        Int32(tree_idx), 1.0 / weight)
+        Int32(tree_idx), 1.0 / weight,
+        state.n_components, state.reachability_enabled)
     CUDA.synchronize()
     return nothing
 end
@@ -238,8 +301,10 @@ function VascularTreeSim._gpu_incremental_scan!(state::GPUDistanceState,
     @cuda threads=threads blocks=blocks _kernel_min_seg_dist_range!(
         state.d_min_dist, state.d_owner,
         state.d_px, state.d_py, state.d_pz,
+        state.d_point_component, state.d_tree_component_allowed,
         d_ax, d_ay, d_az, d_bx, d_by, d_bz,
-        Int32(1), Int32(nseg), Int32(tree_idx), 1.0 / weight)
+        Int32(1), Int32(nseg), Int32(tree_idx), 1.0 / weight,
+        state.n_components, state.reachability_enabled)
     CUDA.synchronize()
 
     CUDA.unsafe_free!(d_ax); CUDA.unsafe_free!(d_ay); CUDA.unsafe_free!(d_az)
@@ -249,13 +314,14 @@ end
 
 function VascularTreeSim._gpu_download_distances(state::GPUDistanceState)
     min_dist = Array(state.d_min_dist)
-    owner = Int.(Array(state.d_owner))
+    owner = Array(state.d_owner)
     return min_dist, owner
 end
 
 function VascularTreeSim._gpu_free!(state::GPUDistanceState)
     CUDA.unsafe_free!(state.d_px); CUDA.unsafe_free!(state.d_py); CUDA.unsafe_free!(state.d_pz)
     CUDA.unsafe_free!(state.d_min_dist); CUDA.unsafe_free!(state.d_owner)
+    CUDA.unsafe_free!(state.d_point_component); CUDA.unsafe_free!(state.d_tree_component_allowed)
     return nothing
 end
 

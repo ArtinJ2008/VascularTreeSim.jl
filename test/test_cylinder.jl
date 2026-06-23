@@ -28,11 +28,17 @@
     dims = ntuple(d -> max(1, Int(ceil((hi_cm[d] - origin_cm[d]) / spacing))), 3)
 
     mask = falses(dims...)
-    for p in domain_pts_list
-        i = clamp(round(Int, (p[1] - origin_cm[1]) / spacing + 0.5), 1, dims[1])
-        j = clamp(round(Int, (p[2] - origin_cm[2]) / spacing + 0.5), 1, dims[2])
-        k = clamp(round(Int, (p[3] - origin_cm[3]) / spacing + 0.5), 1, dims[3])
-        mask[i, j, k] = true
+    empty!(domain_pts_list)
+    for k in 1:dims[3], j in 1:dims[2], i in 1:dims[1]
+        p = origin_cm + SVector((i - 0.5) * spacing, (j - 0.5) * spacing, (k - 0.5) * spacing)
+        if sqrt(p[1]^2 + p[2]^2) <= R && abs(p[3]) <= H / 2
+            mask[i, j, k] = true
+            push!(domain_pts_list, p)
+        end
+    end
+    domain_pts = Matrix{Float64}(undef, length(domain_pts_list), 3)
+    for (i, p) in enumerate(domain_pts_list)
+        domain_pts[i, 1] = p[1]; domain_pts[i, 2] = p[2]; domain_pts[i, 3] = p[3]
     end
 
     # Cylinder barrel + end caps
