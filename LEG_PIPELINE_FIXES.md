@@ -95,10 +95,3 @@ downstream terminals → flow accounting conserves.
   **muscle** (union of `musc*` surfaces), not the whole soft-tissue (skin envelope) interior —
   the physiologically intended target. This also makes the currently-unused demand-weighting
   machinery irrelevant for the muscle-only run.
-
-## Known / not addressed
-- **Domain clipping** still reduces the realized terminal count somewhat below target
-  (data-dependent; unavoidable for a static planner).
-- The **demand-weighted sampler** (`random_points_in_mask_by_demand`) remains unused; only relevant
-  if you run `VTS_TARGET_TISSUE_MODE=soft`.
-- These changes are **logic-verified but not yet compiled/run in Julia.**
