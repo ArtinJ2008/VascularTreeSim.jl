@@ -245,7 +245,12 @@ function restore_xcat_seed_diameters!(tree::GrowthTree, paths::Vector{XCATSeedPa
         path === nothing && continue
         a = tree.vertices[tree.segment_start[s]]
         b = tree.vertices[tree.segment_end[s]]
-        tree.segment_diameter_cm[s] = nearest_path_diameter_cm(path, 0.5 .* (a .+ b))
+        # Keep the larger of the NRB-measured anatomy and the current (post-Murray)
+        # diameter. An unconditional reset would shrink a distal XCAT segment that now
+        # feeds a large grown subtree back below its Murray demand, recreating the
+        # bottleneck that _recompute_all_murray!'s max() was meant to prevent (R ~ 1/r^4).
+        tree.segment_diameter_cm[s] = max(tree.segment_diameter_cm[s],
+            nearest_path_diameter_cm(path, 0.5 .* (a .+ b)))
     end
     return tree
 end

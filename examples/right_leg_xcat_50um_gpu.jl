@@ -768,12 +768,17 @@ function main_right_leg_xcat_50um_gpu()
     branch_caps = branch_caps_from_weights(growth_tree_names,
         [capacity_weights[name] for name in growth_tree_names], target_branches)
     coverage_count = max(target_branches, ceil(Int, target_branches * coverage_multiplier))
+    # Projected post-subdivision terminal count = grown branches x per-terminal subdivision
+    # leaves. The `auto` branch sizes target_branches to the GROWTH stage only, so without
+    # this guard the subdivision can materialize hundreds of millions of segments while
+    # coverage_count stays small and the coverage check below misses it.
+    projected_final_terminals = target_branches * subdivision_factor
     max_default_coverage_points = parse(Int, get(ENV, "VTS_MAX_COVERAGE_POINTS", string(RIGHT_LEG_50UM_MAX_DEFAULT_COVERAGE_POINTS)))
     allow_huge_coverage = parse_bool_arg(get(ENV, "VTS_ALLOW_HUGE_COVERAGE", "false"))
-    if coverage_count > max_default_coverage_points && !allow_huge_coverage
-        error("Requested coverage_count=$(coverage_count), which exceeds the safety limit $(max_default_coverage_points). " *
+    if (coverage_count > max_default_coverage_points || projected_final_terminals > max_default_coverage_points) && !allow_huge_coverage
+        error("Requested coverage_count=$(coverage_count), projected post-subdivision terminals=$(projected_final_terminals), exceeding the safety limit $(max_default_coverage_points). " *
               "For very large runs, pass an explicit target branch count or set VTS_MAX_COVERAGE_POINTS / VTS_ALLOW_HUGE_COVERAGE after confirming memory and disk budget. " *
-              "This guard prevents accidental 6um auto runs from allocating billions of target points.")
+              "This guard prevents accidental low-diameter auto runs from allocating billions of segments.")
     end
     progress_csv_path = joinpath(output_dir, "growth_progress.csv")
     target_demand_audit_csv = joinpath(output_dir, "xcat_right_leg_corrected_target_demand_audit.csv")
@@ -950,11 +955,11 @@ function main_right_leg_xcat_50um_gpu()
     write_growth_csv(csv_path, RIGHT_LEG_50UM_TREE_NAME, tree)
     write_arterial_growth_csv(arterial_csv_path, RIGHT_LEG_50UM_TREE_NAME, tree)
     write_hemodynamic_tree_csv(hemodynamic_csv_path, RIGHT_LEG_50UM_TREE_NAME, tree;
-        min_explicit_diameter_um=flow_explicit_min_diameter_um)
-    write_flow_topology_audit_csv(topology_audit_csv, RIGHT_LEG_50UM_TREE_NAME, tree)
-    write_terminal_path_audit_csv(terminal_path_audit_csv, RIGHT_LEG_50UM_TREE_NAME, tree)
-    write_root_territory_audit_csv(root_territory_audit_csv, RIGHT_LEG_50UM_TREE_NAME, tree)
-    write_diameter_order_audit_csv(diameter_order_audit_csv, RIGHT_LEG_50UM_TREE_NAME, tree)
+        min_explicit_diameter_um=flow_explicit_min_diameter_um, viscosity_poise=blood_viscosity_poise)
+    write_flow_topology_audit_csv(topology_audit_csv, RIGHT_LEG_50UM_TREE_NAME, tree; viscosity_poise=blood_viscosity_poise)
+    write_terminal_path_audit_csv(terminal_path_audit_csv, RIGHT_LEG_50UM_TREE_NAME, tree; viscosity_poise=blood_viscosity_poise)
+    write_root_territory_audit_csv(root_territory_audit_csv, RIGHT_LEG_50UM_TREE_NAME, tree; viscosity_poise=blood_viscosity_poise)
+    write_diameter_order_audit_csv(diameter_order_audit_csv, RIGHT_LEG_50UM_TREE_NAME, tree; viscosity_poise=blood_viscosity_poise)
     write_xcat_seed_csv(xcat_fixed_csv, tree)
     write_xcat_paths_csv(raw_artery_csv, fixed_artery_paths)
     write_xcat_paths_csv(raw_vein_csv, vein_paths)

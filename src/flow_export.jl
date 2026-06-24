@@ -214,7 +214,7 @@ function write_flow_topology_audit_csv(path::AbstractString, branch::String, tre
         arterial_only=arterial_only,
         viscosity_poise=viscosity_poise)
     open(path, "w") do io
-        println(io, "branch,segment_id,parent_segment_id,start_vertex,end_vertex,root_vertex,role,label,is_xcat,generation,branchpoint_generation,strahler_order,child_segments,subtree_terminals,length_mm,diameter_um,length_to_diameter,path_length_mm,path_resistance_rel,orphan_grown_root")
+        println(io, "branch,segment_id,parent_segment_id,start_vertex,end_vertex,root_vertex,role,label,is_xcat,generation,branchpoint_generation,strahler_order,child_segments,subtree_terminals,length_mm,diameter_um,length_to_diameter,path_length_mm,path_resistance_abs,orphan_grown_root")
         for s in eachindex(tree.segment_start)
             arterial_only && !_is_arterial_segment(tree, s) && continue
             start_v = tree.segment_start[s]
@@ -258,7 +258,7 @@ function write_terminal_path_audit_csv(path::AbstractString, branch::String, tre
         arterial_only=arterial_only,
         viscosity_poise=viscosity_poise)
     open(path, "w") do io
-        println(io, "branch,terminal_vertex,root_vertex,incoming_segment,role,label,generation,branchpoint_generation,strahler_order,path_length_mm,path_resistance_rel,min_path_diameter_um,max_path_diameter_um,path_segment_count,degree2_segment_count,max_degree2_chain_segments,path_segments")
+        println(io, "branch,terminal_vertex,root_vertex,incoming_segment,role,label,generation,branchpoint_generation,strahler_order,path_length_mm,path_resistance_abs,min_path_diameter_um,max_path_diameter_um,path_segment_count,degree2_segment_count,max_degree2_chain_segments,path_segments")
         for v in eachindex(tree.vertices)
             isempty(metrics.children_segments[v]) || continue
             incoming = tree.incoming_segment[v]
@@ -309,7 +309,7 @@ function write_root_territory_audit_csv(path::AbstractString, branch::String, tr
     metrics = _tree_topology_metrics(tree; arterial_only=arterial_only)
     roots = sort(unique(v for v in metrics.root_vertex if v > 0))
     open(path, "w") do io
-        println(io, "branch,root_vertex,root_segments,segment_count,terminal_count,max_generation,max_branchpoint_generation,max_path_length_mm,max_path_resistance_rel,root_max_diameter_mm,roles")
+        println(io, "branch,root_vertex,root_segments,segment_count,terminal_count,max_generation,max_branchpoint_generation,max_path_length_mm,max_path_resistance_abs,root_max_diameter_mm,roles")
         for root in roots
             segs = [s for s in eachindex(tree.segment_start)
                 if metrics.root_vertex[tree.segment_end[s]] == root &&
@@ -356,7 +356,7 @@ function write_diameter_order_audit_csv(path::AbstractString, branch::String, tr
     orders = sort(unique(metrics.strahler_order[s] for s in eachindex(tree.segment_start) if segment_filter(s)))
 
     open(path, "w") do io
-        println(io, "branch,strahler_order,segment_count,grown_count,fixed_artery_count,min_diameter_um,p25_diameter_um,median_diameter_um,p75_diameter_um,max_diameter_um,mean_length_mm,median_length_mm,max_length_to_diameter,max_generation,max_branchpoint_generation,max_path_length_mm,max_path_resistance_rel")
+        println(io, "branch,strahler_order,segment_count,grown_count,fixed_artery_count,min_diameter_um,p25_diameter_um,median_diameter_um,p75_diameter_um,max_diameter_um,mean_length_mm,median_length_mm,max_length_to_diameter,max_generation,max_branchpoint_generation,max_path_length_mm,max_path_resistance_abs")
         for order in orders
             segs = [s for s in eachindex(tree.segment_start)
                 if segment_filter(s) && metrics.strahler_order[s] == order]
@@ -445,7 +445,7 @@ function write_hemodynamic_tree_csv(path::AbstractString, branch::String, tree::
             equiv_diameter_um=1.0e4 * max_d,
             min_source_diameter_um=1.0e4 * max_d,
             max_source_diameter_um=1.0e4 * max_d,
-            resistance_rel=0.0,
+            resistance_abs=0.0,
             generation=0,
             strahler_order=isempty(child_ids) ? 1 : maximum(metrics.strahler_order[s] for s in child_ids),
             subtree_terminals=total_terms,
@@ -473,6 +473,7 @@ function write_hemodynamic_tree_csv(path::AbstractString, branch::String, tree::
         grown_count = 0
         orders = Int[]
         current = first_seg
+        pruned_children = Int[]   # sub-threshold beds lumped at EVERY vertex along the conduit
 
         while true
             push!(source_ids, current)
@@ -487,6 +488,13 @@ function write_hemodynamic_tree_csv(path::AbstractString, branch::String, tree::
             push!(orders, metrics.strahler_order[current])
             end_v = tree.segment_end[current]
 
+            # Lump sub-threshold (pruned) arterial children at THIS vertex into the
+            # conduit — including interior vertices we collapse through — so their
+            # terminals are not silently dropped from the flow accounting.
+            for s in child_segments[end_v]
+                (_is_arterial_segment(tree, s) && !exportable(s)) && push!(pruned_children, s)
+            end
+
             next_children = filter(exportable, child_segments[end_v])
             if !(collapse_degree2 && length(next_children) == 1)
                 break
@@ -497,7 +505,6 @@ function write_hemodynamic_tree_csv(path::AbstractString, branch::String, tree::
         flow_id += 1
         this_id = flow_id
         exported_children = filter(exportable, child_segments[end_v])
-        pruned_children = [s for s in child_segments[end_v] if _is_arterial_segment(tree, s) && !exportable(s)]
         chord = norm(tree.vertices[end_v] - tree.vertices[start_v])
         equiv_d = _equiv_diameter_for_resistance(total_len, resistance; viscosity_poise=viscosity_poise)
         push!(rows, (
@@ -518,10 +525,10 @@ function write_hemodynamic_tree_csv(path::AbstractString, branch::String, tree::
             equiv_diameter_um=1.0e4 * equiv_d,
             min_source_diameter_um=1.0e4 * min_d,
             max_source_diameter_um=1.0e4 * max_d,
-            resistance_rel=resistance,
+            resistance_abs=resistance,
             generation=flow_generation,
             strahler_order=isempty(orders) ? 1 : maximum(orders),
-            subtree_terminals=tree.subtree_terminal_count[end_v],
+            subtree_terminals=tree.subtree_terminal_count[tree.segment_end[first_seg]],
             exported_child_count=length(exported_children),
             pruned_child_count=length(pruned_children),
             terminal_bed=isempty(exported_children),
@@ -545,7 +552,7 @@ function write_hemodynamic_tree_csv(path::AbstractString, branch::String, tree::
     end
 
     open(path, "w") do io
-        println(io, "branch,flow_segment_id,parent_flow_segment_id,source_segment_ids,start_vertex,end_vertex,x1_cm,y1_cm,z1_cm,x2_cm,y2_cm,z2_cm,path_length_mm,chord_length_mm,tortuosity,equiv_diameter_um,min_source_diameter_um,max_source_diameter_um,resistance_rel,generation,strahler_order,subtree_terminals,exported_child_count,pruned_child_count,terminal_bed,xcat_segment_count,grown_segment_count,labels")
+        println(io, "branch,flow_segment_id,parent_flow_segment_id,source_segment_ids,start_vertex,end_vertex,x1_cm,y1_cm,z1_cm,x2_cm,y2_cm,z2_cm,path_length_mm,chord_length_mm,tortuosity,equiv_diameter_um,min_source_diameter_um,max_source_diameter_um,resistance_abs,generation,strahler_order,subtree_terminals,exported_child_count,pruned_child_count,terminal_bed,xcat_segment_count,grown_segment_count,labels")
         for r in rows
             println(io, join((
                 branch,
@@ -562,7 +569,7 @@ function write_hemodynamic_tree_csv(path::AbstractString, branch::String, tree::
                 r.equiv_diameter_um,
                 r.min_source_diameter_um,
                 r.max_source_diameter_um,
-                r.resistance_rel,
+                r.resistance_abs,
                 r.generation,
                 r.strahler_order,
                 r.subtree_terminals,

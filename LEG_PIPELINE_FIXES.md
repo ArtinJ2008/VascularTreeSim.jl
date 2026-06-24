@@ -1,122 +1,104 @@
-# Leg pipeline fixes — subdivision budget + XCAT artery-tip guard
+# Leg pipeline fixes — subdivision, Murray, flow-export, domain
 
 **Author:** Yishu Li · **Date:** 2026-06-23 · **Base commit:** `d919e55` ("validated nrb shift")
 
-Two correctness fixes in the two-stage **growth → subdivision** path of the right-leg
-pipeline (`examples/right_leg_xcat_50um_gpu.jl` + `src/growth_tree.jl`). Both were found
-by tracing the terminal-count math end-to-end and reading the actual subdivision recursion.
+A batch of correctness fixes to the right-leg pipeline (two-stage NRB **growth → subdivision**),
+found by a systematic review of the terminal-count math, the Murray recompute, the seed-diameter
+restore, and the flow-export accounting.
+
+> **Status:** logic- and arithmetic-verified (+ `git diff`). **NOT yet compiled/run in Julia** —
+> please `julia`-compile before a production run.
 
 ---
 
-## Fix 1 — `subdivision_factor` undercounts → only ~half the requested terminals
+## 1. `subdivision_factor` undercounts → only ~half the requested terminals
+**File:** `examples/right_leg_xcat_50um_gpu.jl`
 
-**Where:** `examples/right_leg_xcat_50um_gpu.jl`, the `subdivision_factor` line (~line 761).
+The growth-branch budget divided the requested final terminal count by the **continuous**
+estimate `ceil((growth/final)^3)` (= 25³ = 15625 for 200→8 µm). But the actual subdivision is a
+**symmetric binary** bifurcation that yields `2^13 = 8192` leaves per terminal. So `target=20M`
+produced ~10.5 M (≈52%). 50 µm runs were exactly 50%.
 
-**Problem.** The growth-branch budget back-computes how many 200 µm growth branches to
-grow by dividing the requested final terminal count by `subdivision_factor`, which used the
-**continuous** Murray estimate:
+**Fix:** `subdivision_factor = 2^max(0, ceil(3*log2(growth/final)) - 1)` (the real binary leaf
+count). Verified: 8 µm and 50 µm runs now reach ~100% of the requested count.
 
-```julia
-subdivision_factor = ceil(Int, (growth_terminal_cm / final_terminal_cm)^3)   # (200/8)^3 = 25^3 = 15625
-```
+## 2. `subdivide_terminals!` subdivided real XCAT artery tips into fake capillary fans
+**Files:** `src/growth_tree.jl`, `examples/right_leg_xcat_50um_gpu.jl`
 
-But the actual post-growth subdivision (`_subdivide_recursive!` in `growth_tree.jl`) is a
-**symmetric binary bifurcation** (`d_child = d_parent / 2^(1/γ)`) that returns as soon as the
-next child would be `<= target`. From 200 µm to 8 µm that is only **13 whole levels**, so each
-growth terminal yields `2^13 = 8192` leaves — **not** 15625.
+The terminal loop decided to subdivide purely from diameter (no `is_xcat` check), so a mm-scale
+XCAT artery distal tip (e.g. femoral end) that growth never anchored a child to was bifurcated all
+the way to capillary scale — a physiologically meaningless self-similar fan off a major artery.
 
-The planner and the actual subdivision therefore used two different, unreconciled multipliers,
-and nothing checked them against each other. End result for the 8 µm / 20 M run:
+**Fix:** opt-in `skip_xcat::Bool=false` kwarg + `skip_xcat && tree.is_xcat[seg] && continue`; the
+leg call passes `skip_xcat=true`. Default `false` keeps the coronary pipeline unchanged.
 
-```
-target_branches = ceil(20,000,000 / 15625) = 1280
-final           = 1280 × 8192 ≈ 10.5 M   ≈ 52% of the requested 20 M
-```
+## 3. `restore_xcat_seed_diameters!` re-introduced a distal bottleneck
+**File:** `examples/thigh_xcat_femoral_100um.jl`
 
-Every explicit-target run silently produced ~half the intended resolution.
+`_recompute_all_murray!` widens a thin distal XCAT segment that now feeds a large grown subtree
+(its documented anti-bottleneck `max()`). But this function then **unconditionally** reset every
+XCAT segment to its raw NRB diameter, undoing that widening — a thin distal segment becomes a
+bottleneck that dominates path resistance (R ∝ 1/r⁴).
 
-**Fix.** Make `subdivision_factor` equal the *actual* binary leaf count:
+**Fix:** `segment_diameter_cm[s] = max(current_post_Murray, measured)` — keep the larger of the
+measured anatomy and the Murray demand. Affects all leg/thigh callers; the coronary pipeline does
+not call it.
 
-```julia
-subdivision_factor = final_terminal_cm < growth_terminal_cm ?
-    2 ^ max(0, ceil(Int, 3 * log2(growth_terminal_cm / final_terminal_cm)) - 1) : 1
-```
+## 4. `_recompute_all_murray!` over-sized domain-clipped grown segments
+**File:** `src/growth_tree.jl`
 
-`3 * log2(...)` matches γ = 3 (the `^3` it replaces and the `gamma=3.0` used by the subdivision
-call). The `- 1` accounts for the recursion stopping one level early (next child `<= target`),
-which is also why the 50 µm case realizes 32 leaves rather than 64.
+`max(existing, murray_d)` kept the **stale top-down creation diameter** for grown/subdivided
+segments after domain clipping reduced their surviving terminal count → boundary vessels too thick
+(Murray violation). The code comment already stated `murray_d` is authoritative for grown segments.
 
-**Verification (factor → branches → final):**
+**Fix:** grown segments (`is_xcat=false`) use `murray_d` directly; only XCAT segments take the
+`max()` (to preserve measured anatomy that may exceed the Murray demand).
+**Note:** `_recompute_all_murray!` is shared with the coronary pipeline, so this also corrects
+grown-segment sizing there — worth a sanity check on a coronary run.
 
-| growth/final | old factor | old final (% of 20 M) | new factor | new final (% of 20 M) |
-|---|---|---|---|---|
-| 200/8  = 25 | 15625 | 10,485,760 (52%) | **8192** | 20,004,864 (**100%**) |
-| 200/50 = 4  | 64    | 10,000,000 (50%) | **32**   | 20,000,000 (**100%**) |
+## 5. `auto` target + low terminal diameter could OOM
+**File:** `examples/right_leg_xcat_50um_gpu.jl`
 
-**Note.** Domain clipping during subdivision still reduces the final count somewhat below the
-target (out-of-domain sub-branches are pruned); that residual is data-dependent and unavoidable
-for a static planner. This fix removes the systematic ~2× shortfall.
+The safety guard checked `coverage_count` only. The `auto` branch sizes `target_branches` to the
+**growth** stage, so subdivision could then materialize hundreds of millions of segments
+unchecked (e.g. an auto 8 µm run ≈ 5×10⁸ segments) while the guard saw a small coverage count.
 
----
+**Fix:** also guard `projected_final_terminals = target_branches * subdivision_factor` against the
+same limit. The explicit 20 M run passes; an auto low-diameter run is now rejected cleanly (use
+`VTS_ALLOW_HUGE_COVERAGE`).
 
-## Fix 2 — `subdivide_terminals!` subdivides real XCAT artery tips into fake capillary fans
+## 6. flow-export terminal-count non-conservation
+**File:** `src/flow_export.jl`
 
-**Where:** `src/growth_tree.jl` (`subdivide_terminals!`) + `examples/right_leg_xcat_50um_gpu.jl`
-(the subdivision call).
+The degree-2 chain collapse dropped sub-threshold (pruned) beds hanging off **interior** collapsed
+vertices: `pruned_children` and `subtree_terminals` were read only at the chain end, so terminals
+behind interior-pruned branches were lost (sum of children < parent).
 
-**Problem.** `subdivide_terminals!` collects **every** leaf via
-`_branch_terminals(tree) = [i for i in vertices if isempty(children[i])]` and decides whether to
-subdivide **purely from the incoming segment's diameter** — there is no `is_xcat` check:
+**Fix:** accumulate pruned children at **every** vertex along the conduit; report
+`subtree_terminals` at the conduit **entry** (`segment_end[first_seg]`), which includes all
+downstream terminals → flow accounting conserves.
 
-```julia
-for tip_v in terminals
-    seg = tree.incoming_segment[tip_v]
-    seg == 0 && continue
-    d_cm = tree.segment_diameter_cm[seg]
-    d_cm <= target_diameter_cm && continue   # only filter is diameter
-    ...
-```
+## 7. flow-export resistance columns mislabeled + wrong viscosity
+**Files:** `src/flow_export.jl`, `examples/right_leg_xcat_50um_gpu.jl`
 
-A distal tip of an XCAT arterial seed (e.g. the femoral distal end) is a leaf that keeps its
-measured **mm-scale** diameter when growth did not anchor a child there. Since mm ≫ target, it is
-subdivided like a grown terminal: a ~2–4 mm tip is recursively bifurcated down to the target
-(~24–27 levels), sprouting a large self-similar symmetric fan (with random-rotation geometry) off
-a major artery — physiologically meaningless. (Domain clipping prunes out-of-domain children, so
-this is a geometry/realism bug rather than a guaranteed OOM, but it is still wrong.)
-
-**Fix (opt-in, so the shared heart pipeline is unaffected).** Add a `skip_xcat` flag (default
-`false`) to `subdivide_terminals!` and skip XCAT seed terminals when it is on:
-
-```julia
-# signature
-skip_xcat::Bool=false,
-# in the loop, right after `seg == 0 && continue`
-skip_xcat && tree.is_xcat[seg] && continue
-```
-
-and turn it on only at the leg call:
-
-```julia
-subdivide_terminals!(trees[name]; ..., skip_xcat=true, domain=route_domain)
-```
-
-With this, only grown terminals are subdivided; real XCAT artery tips are left as-is (their
-downstream perfusion comes from branches grown off their sides, not from a fan at the tip).
-The heart pipeline (`run_coronary_growth.jl`) does not pass the flag → default `false` → unchanged.
+- Columns named `*_resistance_rel` actually held **absolute** Poiseuille resistance → renamed
+  `*_resistance_abs`. **Heads up:** any downstream reader keying on the old column name must update.
+- Flow-export calls didn't pass a viscosity, so they silently used `0.035 P` even when
+  `VTS_BLOOD_VISCOSITY_POISE` was overridden → now thread `blood_viscosity_poise` into all five
+  flow-export calls.
 
 ---
 
-## Still open (from the same review, not addressed here)
+## Config change
+- `scripts/launch_right_leg_active_xcat_8um_20m.sh` now defaults to
+  `VTS_TARGET_TISSUE_MODE=muscle` (was `soft`). The growth/coverage domain is the right-leg
+  **muscle** (union of `musc*` surfaces), not the whole soft-tissue (skin envelope) interior —
+  the physiologically intended target. This also makes the currently-unused demand-weighting
+  machinery irrelevant for the muscle-only run.
 
-- **`auto` target branch** does not divide by `subdivision_factor`, and the coverage guard does
-  not catch the post-subdivision blow-up → potential OOM on a low-diameter `auto` run.
-- **`_recompute_all_murray!`** uses `max(existing, murray_d)`, which keeps oversized stale
-  diameters for clipped boundary segments (Murray violation near the domain edge).
-- **`restore_xcat_seed_diameters!`** unconditionally resets XCAT diameters after the Murray
-  recompute, undoing the anti-bottleneck `max()` and reintroducing distal bottlenecks
-  (dominates Poiseuille resistance, R ∝ 1/r⁴).
-- **`flow_export.jl`**: degree-2 chain collapse drops interior-pruned beds (subtree-terminal
-  undercount / non-conservation); `*_resistance_rel` columns hold absolute resistance; viscosity
-  hardcoded 0.035 (ignores `VTS_BLOOD_VISCOSITY_POISE`).
-- **demand weights** (`VTS_TARGET_DEMAND_MODE=weighted`) are parsed but never used — sampling is
-  always uniform (skin/fat perfused like muscle).
+## Known / not addressed
+- **Domain clipping** still reduces the realized terminal count somewhat below target
+  (data-dependent; unavoidable for a static planner).
+- The **demand-weighted sampler** (`random_points_in_mask_by_demand`) remains unused; only relevant
+  if you run `VTS_TARGET_TISSUE_MODE=soft`.
+- These changes are **logic-verified but not yet compiled/run in Julia.**

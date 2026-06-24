@@ -786,11 +786,14 @@ function _recompute_all_murray!(tree::GrowthTree; target_diameter_cm::Float64, g
             #     → 6× root Poiseuille R, flow chokes at root
             #   • leaving a 0.6 mm distal XCAT bottleneck intact
             #     → flow chokes at the XCAT→grown junction
-            # For grown/subdivided segments (is_xcat=false), murray_d is the
-            # authoritative value by design, so max() just recovers that.
+            # For grown/subdivided segments (is_xcat=false), murray_d (from the
+            # recomputed, post-clipping terminal count) is authoritative and is used
+            # directly: max() with the stale top-down creation diameter would keep an
+            # OVERSIZED value wherever domain clipping reduced the surviving terminals.
             n = tree.subtree_terminal_count[v]
             murray_d = target_diameter_cm * n^(1.0 / gamma)
-            tree.segment_diameter_cm[seg] = max(tree.segment_diameter_cm[seg], murray_d)
+            tree.segment_diameter_cm[seg] = tree.is_xcat[seg] ?
+                max(tree.segment_diameter_cm[seg], murray_d) : murray_d
         end
     end
 
