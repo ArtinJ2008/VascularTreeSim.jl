@@ -5,6 +5,11 @@ Vascular tree generation by competitive constrained-constructive optimization
 (`.nrb`) or a synthetic geometry; output is a per-tree segment CSV and an
 interactive 3-D HTML viewer.
 
+For the current right-leg XCAT workflow, `.nrb` is the only supported anatomy
+input. Legacy `.raw`/`.nhdr` leg examples are retained only as helper code and
+will error if run directly. Output `.raw`/`.nhdr` masks, when present, are
+derived viewer/debug artifacts generated from the parsed NRB domains.
+
 The package is **organ-agnostic** — every organ-specific value (surface names,
 root anchors, root diameters, target flows) lives in a `.toml` config. No
 LAD/LCX/RCA strings are hardcoded in the source; the same code grows brain or
@@ -66,12 +71,13 @@ The downstream flow simulator
 
 ## Key concepts
 
-**Murray's law on every segment.** Both grown (round-robin) and subdivided
-(recursive bifurcation) segments take their diameter from
-`d = d_term · N^(1/γ)` where `N` is the count of capillary terminals in the
-subtree below and γ = 3. XCAT-derived ostia keep `max(NRB-measured, Murray)`
-so a clinically realistic root (e.g. 3.7 mm for LAD) survives even when the
-subtree is small.
+**Configurable Murray diameter law.** Grown and subdivided segments take their
+diameter from downstream terminal count. By default this is the standard
+`d = d_term · N^(1/γ)` relation. For large conduit ranges, configs can set
+`proximal_murray_gamma` and `murray_transition_diameter_cm` so distal beds use
+the normal microvascular exponent while proximal segments use a separate
+continuous exponent above the transition. XCAT-derived segments keep
+`max(NRB-measured, computed)` so measured anatomy is not shrunk away.
 
 **Weighted-Voronoi territory.** Each tree claims tissue up to
 `(d_i / d_j) ×` farther than a competitor with smaller root diameter,
@@ -234,6 +240,8 @@ min_frontier_separation_cm = 0.015
 max_path_nodes = 20
 frontier_batch = 28                        # per-round frontier targets per tree
 murray_gamma = 3.0
+proximal_murray_gamma = 2.0             # optional conduit/proximal exponent
+murray_transition_diameter_cm = 0.02    # 200 μm transition into routed growth
 max_segment_length_cm = 0.1
 smooth_passes = 20                         # Laplacian smoothing of paths
 spline_density = 5
@@ -251,6 +259,8 @@ min_hydraulic_score_cm = 0.0               # reject if coverage benefit/cost is 
 max_new_branch_resistance_rel = inf        # optional hard cap vs reference vessel
 max_terminal_path_resistance_rel = inf     # optional hard cap including upstream path
 blood_viscosity_poise = 0.035              # 3.5 cP
+min_initial_territory_fraction = 0.0       # >0 gives each active seed a small reachable target floor
+max_initial_territory_points_per_tree = 1024 # cap on that initial bootstrap floor
 ```
 
 `[seed_points]` is only consulted when `growth.mode = "seed_point"`.

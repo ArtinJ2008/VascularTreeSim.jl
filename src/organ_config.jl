@@ -50,6 +50,8 @@ struct OrganConfig
     max_path_nodes::Int
     frontier_batch::Int
     murray_gamma::Float64
+    proximal_murray_gamma::Float64
+    murray_transition_diameter_cm::Float64
     max_segment_length_cm::Float64
     smooth_passes::Int
     spline_density::Int
@@ -67,6 +69,8 @@ struct OrganConfig
     max_new_branch_resistance_rel::Float64
     max_terminal_path_resistance_rel::Float64
     blood_viscosity_poise::Float64
+    min_initial_territory_fraction::Float64
+    max_initial_territory_points_per_tree::Int
 
     # Seed points (for :seed_point mode)
     seed_points::Dict{String, SVector{3,Float64}}
@@ -128,6 +132,8 @@ function load_organ_config(path::AbstractString)
     max_path_nodes = get(gr, "max_path_nodes", 20)
     frontier_batch = get(gr, "frontier_batch", 8)
     murray_gamma = get(gr, "murray_gamma", 3.0)
+    proximal_murray_gamma = get(gr, "proximal_murray_gamma", murray_gamma)
+    murray_transition_diameter_cm = get(gr, "murray_transition_diameter_cm", Inf)
     max_segment_length_cm = get(gr, "max_segment_length_cm", 0.1)
     smooth_passes = get(gr, "smooth_passes", 20)
     spline_density = get(gr, "spline_density", 5)
@@ -145,6 +151,8 @@ function load_organ_config(path::AbstractString)
     max_new_branch_resistance_rel = get(gr, "max_new_branch_resistance_rel", Inf)
     max_terminal_path_resistance_rel = get(gr, "max_terminal_path_resistance_rel", Inf)
     blood_viscosity_poise = get(gr, "blood_viscosity_poise", 0.035)
+    min_initial_territory_fraction = get(gr, "min_initial_territory_fraction", 0.0)
+    max_initial_territory_points_per_tree = get(gr, "max_initial_territory_points_per_tree", 1024)
 
     seed_points = Dict{String, SVector{3,Float64}}()
     if haskey(cfg, "seed_points")
@@ -161,12 +169,12 @@ function load_organ_config(path::AbstractString)
         growth_mode, effective_supply_radius_cm, capillary_diameter_cm, terminal_diameter_cm, subdivision_terminal_diameter_cm,
         subdivision_max_ld_ratio, subdivision_clip_below_diameter_cm,
         max_new_branches_per_tree, graph_neighbors, min_frontier_separation_cm,
-        max_path_nodes, frontier_batch, murray_gamma, max_segment_length_cm,
+        max_path_nodes, frontier_batch, murray_gamma, proximal_murray_gamma, murray_transition_diameter_cm, max_segment_length_cm,
         smooth_passes, spline_density, coverage_stride, graph_stride, graph_jitter_cm, turn_penalty,
         target_p95_distance_cm, target_max_distance_cm,
         hydraulic_cost_weight, hydraulic_rank_candidate_factor, hydraulic_reference_length_cm, hydraulic_existing_path_weight,
         min_hydraulic_score_cm, max_new_branch_resistance_rel, max_terminal_path_resistance_rel,
-        blood_viscosity_poise,
+        blood_viscosity_poise, min_initial_territory_fraction, max_initial_territory_points_per_tree,
         seed_points,
     )
 end

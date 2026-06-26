@@ -158,7 +158,8 @@ function _sample_domain_neighbors_grid(points::Vector{SVector{3, Float64}},
         pivot = points[i]
         candidates = _surface_candidates(grid, (pivot[1], pivot[2], pivot[3]);
             max_rings=rings,
-            min_candidates=candidate_goal)
+            min_candidates=candidate_goal,
+            min_rings=min(rings, 1))
         best = _domain_valid_neighbors(points, candidates, i, k, domain)
         length(best) >= k && return best
         rings >= max_possible_rings && break
@@ -194,7 +195,7 @@ function build_domain_graph(points_cm::Matrix{Float64}, domain; k::Int=10)
         maximum(point_matrix[:, 2]) + pad,
         maximum(point_matrix[:, 3]) + pad,
     )
-    grid = _build_point_grid(point_matrix, lo, hi)
+    grid = _build_point_grid(point_matrix, lo, hi; max_extent_divisor=0.0)
     n = length(pts)
     neighbors = [Int[] for _ in 1:n]
     costs = [Float64[] for _ in 1:n]
@@ -231,7 +232,7 @@ function _build_graph_spatial_grid(graph::DomainGraph)
     pad = 1e-6
     lo = (minimum(mat[:, 1]) - pad, minimum(mat[:, 2]) - pad, minimum(mat[:, 3]) - pad)
     hi = (maximum(mat[:, 1]) + pad, maximum(mat[:, 2]) + pad, maximum(mat[:, 3]) + pad)
-    grid = _build_point_grid(mat, lo, hi)
+    grid = _build_point_grid(mat, lo, hi; max_extent_divisor=0.0)
     return GraphSpatialGrid(graph.points, grid)
 end
 

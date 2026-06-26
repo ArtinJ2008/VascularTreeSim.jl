@@ -318,6 +318,16 @@ function VascularTreeSim._gpu_download_distances(state::GPUDistanceState)
     return min_dist, owner
 end
 
+function VascularTreeSim._gpu_upload_distances!(state::GPUDistanceState,
+                                                 min_dist::Vector{Float64},
+                                                 owner::AbstractVector{<:Integer})
+    length(min_dist) == state.n_points || error("min_dist length mismatch")
+    length(owner) == state.n_points || error("owner length mismatch")
+    copyto!(state.d_min_dist, min_dist)
+    copyto!(state.d_owner, Int32.(owner))
+    return nothing
+end
+
 function VascularTreeSim._gpu_free!(state::GPUDistanceState)
     CUDA.unsafe_free!(state.d_px); CUDA.unsafe_free!(state.d_py); CUDA.unsafe_free!(state.d_pz)
     CUDA.unsafe_free!(state.d_min_dist); CUDA.unsafe_free!(state.d_owner)

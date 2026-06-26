@@ -1,17 +1,12 @@
 """
     thigh_raw_nrrd_femoral_smoke.jl
 
-Smoke-test vessel growth in a binary thigh mask using anatomy-informed fixed
-arterial seeds. The seeds are snapped into the foreground mask slice-by-slice:
-
-- femoral artery through the femoral triangle, adductor canal, and hiatus
-- profunda femoris branch in the deep posterior thigh
-- medial and lateral circumflex branches in the proximal thigh
-- three perforator-style branches toward the posterior compartment
-- distal descending-genicular-style branch near the adductor canal
+Legacy detached-NRRD femoral smoke-test helper. Direct execution is disabled:
+current right-leg XCAT workflows are NRB-input-only. Helper functions remain
+available to the NRB runner.
 
 Usage:
-    julia --project=. examples/thigh_raw_nrrd_femoral_smoke.jl [nhdr_path] [max_branches]
+    julia --project=. examples/right_leg_xcat_50um_gpu.jl [terminal_um] [output_dir] [nrb_path] ...
 """
 
 include(joinpath(@__DIR__, "thigh_raw_nrrd_smoke.jl"))
@@ -1207,5 +1202,5 @@ function main_femoral()
 end
 
 if abspath(PROGRAM_FILE) == @__FILE__
-    main_femoral()
+    legacy_raw_entrypoint_error("examples/thigh_raw_nrrd_femoral_smoke.jl")
 end

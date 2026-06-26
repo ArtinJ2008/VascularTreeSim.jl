@@ -1,11 +1,12 @@
 """
     thigh_raw_nrrd_smoke.jl
 
-Smoke-test vessel growth in a binary thigh mask stored as detached NRRD:
-`*.nhdr` metadata plus `*.raw` voxel data.
+Legacy smoke-test helper for a binary thigh mask stored as detached NRRD.
+Direct execution is disabled: current right-leg XCAT workflows are
+NRB-input-only. Helper functions remain available to the NRB runner.
 
 Usage:
-    julia --project=. examples/thigh_raw_nrrd_smoke.jl [nhdr_path] [max_branches]
+    julia --project=. examples/right_leg_xcat_50um_gpu.jl [terminal_um] [output_dir] [nrb_path] ...
 """
 
 using VascularTreeSim
@@ -22,6 +23,10 @@ const LABEL_VALUE = UInt8(255)
 const TERMINAL_DIAMETER_CM = 0.06
 const COVERAGE_BLOCK_SIZE = 8
 const VIEWER_BLOCK_SIZE = 5
+
+function legacy_raw_entrypoint_error(script::AbstractString)
+    error("$script is a legacy raw/NRRD entry point and is disabled. Use examples/right_leg_xcat_50um_gpu.jl with a `.nrb` input instead.")
+end
 
 function parse_nhdr(path::AbstractString)
     fields = Dict{String, String}()
@@ -303,5 +308,5 @@ function main()
 end
 
 if abspath(PROGRAM_FILE) == @__FILE__
-    main()
+    legacy_raw_entrypoint_error("examples/thigh_raw_nrrd_smoke.jl")
 end

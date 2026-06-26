@@ -1,16 +1,12 @@
 """
     thigh_xcat_main_arteries_50um_gpu.jl
 
-Large right-thigh GPU run seeded from the selected main XCAT artery patches.
-The run samples enough tissue target points for Murray scaling to bring the
-root branch to the extracted femoral diameter at a 50 um terminal diameter.
-
-This script intentionally skips the embedded HTML viewer because a 50 um full
-run can produce tens of millions of segments. Generate downsampled viewers from
-the CSV after the run.
+Legacy raw-label right-thigh GPU run helper. Direct execution is disabled:
+current right-leg XCAT workflows are NRB-input-only. Helper functions remain
+available to the NRB runner.
 
 Usage:
-    julia --project=. examples/thigh_xcat_main_arteries_50um_gpu.jl [terminal_um] [output_dir] [seed_csv] [raw_path] [organ_ids] [xcat_log] [target_branches_or_auto] [frontier_batch] [graph_block_size] [min_frontier_separation_cm] [max_segment_length_cm] [graph_neighbors] [max_path_nodes] [graph_jitter_cm] [snap_terminal_to_target] [max_terminal_snap_cm] [coverage_multiplier] [use_indexed_anchor] [use_astar_routing] [frontier_candidate_factor]
+    julia --project=. examples/right_leg_xcat_50um_gpu.jl [terminal_um] [output_dir] [nrb_path] ...
 """
 
 include(joinpath(@__DIR__, "thigh_xcat_femoral_100um.jl"))
@@ -305,5 +301,5 @@ function main_50um_gpu()
 end
 
 if abspath(PROGRAM_FILE) == @__FILE__
-    main_50um_gpu()
+    legacy_raw_entrypoint_error("examples/thigh_xcat_main_arteries_50um_gpu.jl")
 end

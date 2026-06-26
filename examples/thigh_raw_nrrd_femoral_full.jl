@@ -1,16 +1,12 @@
 """
     thigh_raw_nrrd_femoral_full.jl
 
-Full thigh vessel-growth run for the detached raw+NRRD thigh mask. This reuses
-the anatomy-informed femoral/profunda/circumflex/perforator seed geometry from
-`thigh_raw_nrrd_femoral_smoke.jl`, but runs with denser sampling, many more
-branches, CUDA acceleration, and a separate output folder.
+Legacy detached-NRRD femoral full-run helper. Direct execution is disabled:
+current right-leg XCAT workflows are NRB-input-only. Helper functions remain
+available to the NRB runner.
 
 Usage:
-    julia --project=. examples/thigh_raw_nrrd_femoral_full.jl [nhdr_path] [max_branches] [coverage_block] [route_block] [terminal_um]
-
-Defaults:
-    max_branches=2500, coverage_block=4, route_block=4, terminal_um=400
+    julia --project=. examples/right_leg_xcat_50um_gpu.jl [terminal_um] [output_dir] [nrb_path] ...
 """
 
 include(joinpath(@__DIR__, "thigh_raw_nrrd_femoral_smoke.jl"))
@@ -196,4 +192,6 @@ function main_full()
     println("  $(summary_path)")
 end
 
-main_full()
+if abspath(PROGRAM_FILE) == @__FILE__
+    legacy_raw_entrypoint_error("examples/thigh_raw_nrrd_femoral_full.jl")
+end

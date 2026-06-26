@@ -87,6 +87,8 @@ export build_voxel_shell_domain_floodfill,
 # ── Tree construction ──
 export growth_tree_from_xcat,
        growth_tree_from_seed,
+       murray_diameter_from_terminals,
+       murray_terminal_capacity,
        smooth_junction_taper!,
        subdivide_terminals!
 
@@ -124,6 +126,7 @@ export write_growth_csv,
        write_root_territory_audit_csv,
        write_diameter_order_audit_csv,
        write_hemodynamic_tree_csv,
+       write_terminal_bed_audit_csv,
        growth_viewer_html,
        domain_check_html
 

@@ -17,7 +17,7 @@ export CUDA_DEVICE_ORDER="PCI_BUS_ID"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-2}"
 export VTS_MAX_GRAPH_BLOCK_SIZE="${VTS_MAX_GRAPH_BLOCK_SIZE:-1}"
 export VTS_TARGET_TISSUE_MODE="${VTS_TARGET_TISSUE_MODE:-soft}"
-export VTS_TARGET_DEMAND_MODE="${VTS_TARGET_DEMAND_MODE:-uniform}"
+export VTS_TARGET_DEMAND_MODE="${VTS_TARGET_DEMAND_MODE:-weighted}"
 export VTS_TARGET_DEMAND_WEIGHTS="${VTS_TARGET_DEMAND_WEIGHTS:-muscle=1.0,skin=0.2,fat=0.05,envelope=0.1,other_soft=0.1}"
 export VTS_FLOW_EXPLICIT_MIN_DIAMETER_UM="${VTS_FLOW_EXPLICIT_MIN_DIAMETER_UM:-50.0}"
 export VTS_MAX_BRANCH_LENGTH_CM="${VTS_MAX_BRANCH_LENGTH_CM:-Inf}"
@@ -30,11 +30,16 @@ export VTS_MIN_HYDRAULIC_SCORE_CM="${VTS_MIN_HYDRAULIC_SCORE_CM:-0.0}"
 export VTS_MAX_NEW_BRANCH_RESISTANCE_REL="${VTS_MAX_NEW_BRANCH_RESISTANCE_REL:-Inf}"
 export VTS_MAX_TERMINAL_PATH_RESISTANCE_REL="${VTS_MAX_TERMINAL_PATH_RESISTANCE_REL:-Inf}"
 export VTS_BLOOD_VISCOSITY_POISE="${VTS_BLOOD_VISCOSITY_POISE:-0.035}"
+export VTS_MIN_INITIAL_TERRITORY_FRACTION="${VTS_MIN_INITIAL_TERRITORY_FRACTION:-0.05}"
+export VTS_MAX_INITIAL_TERRITORY_POINTS="${VTS_MAX_INITIAL_TERRITORY_POINTS:-4096}"
 export VTS_XCAT_NRB_PATH="${VTS_XCAT_NRB_PATH:-${INPUT}/both_legs_1.nrb}"
 export VTS_XCAT_VESSEL_SOURCE="${VTS_XCAT_VESSEL_SOURCE:-nrb}"
 export VTS_NRB_DOMAIN_VOXEL_SPACING_CM="${VTS_NRB_DOMAIN_VOXEL_SPACING_CM:-0.1}"
 export VTS_NRB_DOMAIN_SAMPLES="${VTS_NRB_DOMAIN_SAMPLES:-48,48}"
 export VTS_EXPLICIT_TERMINAL_UM="${VTS_EXPLICIT_TERMINAL_UM:-200.0}"
+export VTS_DISTAL_MURRAY_GAMMA="${VTS_DISTAL_MURRAY_GAMMA:-3.0}"
+export VTS_PROXIMAL_MURRAY_GAMMA="${VTS_PROXIMAL_MURRAY_GAMMA:-2.0}"
+export VTS_MURRAY_TRANSITION_UM="${VTS_MURRAY_TRANSITION_UM:-200.0}"
 export VTS_SUBDIVISION_MAX_LD_RATIO="${VTS_SUBDIVISION_MAX_LD_RATIO:-25.0}"
 export VTS_SUBDIVISION_CLIP_BELOW_UM="${VTS_SUBDIVISION_CLIP_BELOW_UM:-0.0}"
 
@@ -48,6 +53,9 @@ export VTS_SUBDIVISION_CLIP_BELOW_UM="${VTS_SUBDIVISION_CLIP_BELOW_UM:-0.0}"
     echo "nrb_domain_voxel_spacing_cm=${VTS_NRB_DOMAIN_VOXEL_SPACING_CM}"
     echo "nrb_domain_samples=${VTS_NRB_DOMAIN_SAMPLES}"
     echo "explicit_terminal_um=${VTS_EXPLICIT_TERMINAL_UM}"
+    echo "distal_murray_gamma=${VTS_DISTAL_MURRAY_GAMMA}"
+    echo "proximal_murray_gamma=${VTS_PROXIMAL_MURRAY_GAMMA}"
+    echo "murray_transition_um=${VTS_MURRAY_TRANSITION_UM}"
     echo "subdivision_max_ld_ratio=${VTS_SUBDIVISION_MAX_LD_RATIO}"
     echo "subdivision_clip_below_um=${VTS_SUBDIVISION_CLIP_BELOW_UM}"
     echo "output=${OUT}"
@@ -74,6 +82,8 @@ export VTS_SUBDIVISION_CLIP_BELOW_UM="${VTS_SUBDIVISION_CLIP_BELOW_UM:-0.0}"
     echo "max_new_branch_resistance_rel=${VTS_MAX_NEW_BRANCH_RESISTANCE_REL}"
     echo "max_terminal_path_resistance_rel=${VTS_MAX_TERMINAL_PATH_RESISTANCE_REL}"
     echo "blood_viscosity_poise=${VTS_BLOOD_VISCOSITY_POISE}"
+    echo "min_initial_territory_fraction=${VTS_MIN_INITIAL_TERRITORY_FRACTION}"
+    echo "max_initial_territory_points=${VTS_MAX_INITIAL_TERRITORY_POINTS}"
     echo "fixed_vein_exports=6"
     echo "main_xcat_artery_seeds=all eligible"
 } > "${OUT}/run_metadata.txt"
@@ -82,9 +92,7 @@ exec /home/molloi-lab/.juliaup/bin/julia --project=. \
     examples/right_leg_xcat_50um_gpu.jl \
     30.0 \
     "${OUT}" \
-    "${INPUT}/both_legs_act_1.raw" \
-    "${INPUT}/organ_ids.txt" \
-    "${INPUT}/both_legs_log" \
+    "${VTS_XCAT_NRB_PATH}" \
     auto \
     4096 \
     1 \

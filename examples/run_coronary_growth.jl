@@ -281,6 +281,8 @@ graph, territories, stats = grow_trees_mcp!(growth_trees, domain;
     max_path_nodes=config.max_path_nodes,
     frontier_batch=config.frontier_batch,
     gamma=config.murray_gamma,
+    proximal_gamma=config.proximal_murray_gamma,
+    murray_transition_diameter_cm=config.murray_transition_diameter_cm,
     smooth_passes=config.smooth_passes,
     spline_density=config.spline_density,
     max_segment_length_cm=config.max_segment_length_cm,
@@ -303,9 +305,10 @@ flush(stdout)
 # Grown (is_xcat=false) segments are left alone — their diameters are
 # Murray-derived from terminal_diameter_cm and should not be rescaled.
 # The subsequent `_recompute_all_murray!` (called inside subdivide_terminals!)
-# uses `max(existing_d, murray_d)` for XCAT segments, so the override persists
-# through subdivision as long as murray_d < override (which holds unless the
-# subtree is enormously larger than the XCAT root can accommodate).
+# uses `max(existing_d, computed_d)` for XCAT segments, so the override persists
+# through subdivision as long as computed_d < override (which holds unless the
+# subtree is enormously larger than the XCAT root can accommodate). Grown and
+# subdivided segments are recomputed directly from terminal count.
 for spec in config.vessel_trees
     override_d = spec.root_diameter_override_cm
     (override_d > 0 && haskey(growth_trees, spec.name)) || continue
@@ -330,6 +333,8 @@ if config.subdivision_terminal_diameter_cm > 0.0 && config.subdivision_terminal_
         subdivide_terminals!(tree;
             target_diameter_cm=config.subdivision_terminal_diameter_cm,
             gamma=config.murray_gamma,
+            proximal_gamma=config.proximal_murray_gamma,
+            transition_diameter_cm=config.murray_transition_diameter_cm,
             max_ld_ratio=config.subdivision_max_ld_ratio,
             clip_below_diameter_cm=config.subdivision_clip_below_diameter_cm,
             domain=domain)

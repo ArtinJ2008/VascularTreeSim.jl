@@ -48,5 +48,8 @@ function _gpu_incremental_scan! end
 """Download current min_dist and owner arrays from GPU to CPU."""
 function _gpu_download_distances end
 
+"""Upload corrected min_dist and owner arrays from CPU to GPU."""
+function _gpu_upload_distances! end
+
 """Free GPU memory associated with the distance state."""
 function _gpu_free! end

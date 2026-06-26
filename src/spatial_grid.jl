@@ -24,18 +24,24 @@ function _point_grid_dims(lo::NTuple{3, Float64}, hi::NTuple{3, Float64}, cell_s
     )
 end
 
-function _default_point_grid_size(points::Matrix{Float64}, lo::NTuple{3, Float64}, hi::NTuple{3, Float64})
+function _default_point_grid_size(points::Matrix{Float64}, lo::NTuple{3, Float64}, hi::NTuple{3, Float64};
+                                  max_extent_divisor::Real=64.0)
     dx = hi[1] - lo[1]
     dy = hi[2] - lo[2]
     dz = hi[3] - lo[3]
     extent = max(dx, dy, dz)
     bbox_vol = max(dx * dy * dz, 1e-12)
     nominal_spacing = cbrt(bbox_vol / max(size(points, 1), 1))
-    return max(nominal_spacing * 2.5, extent / 64.0, 1e-4)
+    cell_size = max(nominal_spacing * 2.5, 1e-4)
+    if isfinite(Float64(max_extent_divisor)) && max_extent_divisor > 0
+        cell_size = max(cell_size, extent / Float64(max_extent_divisor))
+    end
+    return cell_size
 end
 
-function _build_point_grid(points::Matrix{Float64}, lo::NTuple{3, Float64}, hi::NTuple{3, Float64})
-    cell_size = _default_point_grid_size(points, lo, hi)
+function _build_point_grid(points::Matrix{Float64}, lo::NTuple{3, Float64}, hi::NTuple{3, Float64};
+                           max_extent_divisor::Real=64.0)
+    cell_size = _default_point_grid_size(points, lo, hi; max_extent_divisor=max_extent_divisor)
     dims = _point_grid_dims(lo, hi, cell_size)
     cells = Dict{Int, Vector{Int}}()
     grid = PointCloudGrid(cell_size, lo, dims, cells)
@@ -46,12 +52,14 @@ function _build_point_grid(points::Matrix{Float64}, lo::NTuple{3, Float64}, hi::
     return grid
 end
 
-function _surface_candidates(grid::PointCloudGrid, point; max_rings::Int=2, min_candidates::Int=32)
+function _surface_candidates(grid::PointCloudGrid, point; max_rings::Int=2,
+                             min_candidates::Int=32, min_rings::Int=0)
     x, y, z = point
     cx = clamp(floor(Int, (x - grid.origin[1]) / grid.cell_size) + 1, 1, grid.dims[1])
     cy = clamp(floor(Int, (y - grid.origin[2]) / grid.cell_size) + 1, 1, grid.dims[2])
     cz = clamp(floor(Int, (z - grid.origin[3]) / grid.cell_size) + 1, 1, grid.dims[3])
     candidates = Int[]
+    min_rings = clamp(min_rings, 0, max_rings)
     for ring in 0:max_rings
         for dz in -ring:ring
             iz = cz + dz
@@ -69,7 +77,7 @@ function _surface_candidates(grid::PointCloudGrid, point; max_rings::Int=2, min_
                 end
             end
         end
-        length(candidates) >= min_candidates && break
+        ring >= min_rings && length(candidates) >= min_candidates && break
     end
     return candidates
 end

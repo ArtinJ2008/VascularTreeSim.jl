@@ -152,9 +152,15 @@ Since ALL segment diameters (including XCAT) are now Murray-derived from
 subtree_terminal_count, Murray's law is automatically satisfied at every
 junction. The only fixed constraint is the root segment diameter.
 """
-function _can_add_terminal_at_anchor(tree::GrowthTree, anchor_vertex::Int; gamma::Float64=3.0)
+function _can_add_terminal_at_anchor(tree::GrowthTree, anchor_vertex::Int;
+        gamma::Float64=3.0,
+        proximal_gamma::Float64=gamma,
+        transition_diameter_cm::Float64=Inf)
     tree.root_diameter_cm <= 0.0 && return true  # seed tree: no budget limit
-    max_terminals = (tree.root_diameter_cm / tree.terminal_diameter_cm)^gamma
+    max_terminals = murray_terminal_capacity(tree.root_diameter_cm, tree.terminal_diameter_cm;
+        gamma=gamma,
+        proximal_gamma=proximal_gamma,
+        transition_diameter_cm=transition_diameter_cm)
     current = tree.subtree_terminal_count[tree.root_vertex]
     return current + 1 <= max_terminals + 0.5  # +0.5 for float tolerance
 end
@@ -172,14 +178,21 @@ All segment diameters are purely Murray-derived — no segment is locked.
 The `root_diameter_cm` field is only used as a budget ceiling in
 `_can_add_terminal_at_anchor`, not for diameter assignment.
 """
-function _strict_murray_propagate!(tree::GrowthTree, start_vertex::Int; gamma::Float64=3.0, added::Int=1)
+function _strict_murray_propagate!(tree::GrowthTree, start_vertex::Int;
+        gamma::Float64=3.0,
+        added::Int=1,
+        proximal_gamma::Float64=gamma,
+        transition_diameter_cm::Float64=Inf)
     v = start_vertex
     while v != 0
         tree.subtree_terminal_count[v] += added
         seg = tree.incoming_segment[v]
         if seg != 0
             n = tree.subtree_terminal_count[v]
-            tree.segment_diameter_cm[seg] = tree.terminal_diameter_cm * n^(1.0 / gamma)
+            tree.segment_diameter_cm[seg] = murray_diameter_from_terminals(n, tree.terminal_diameter_cm;
+                gamma=gamma,
+                proximal_gamma=proximal_gamma,
+                transition_diameter_cm=transition_diameter_cm)
         end
         v = tree.parent_vertex[v]
     end
@@ -187,6 +200,73 @@ function _strict_murray_propagate!(tree::GrowthTree, start_vertex::Int; gamma::F
 end
 
 _branch_terminals(tree::GrowthTree) = [i for i in eachindex(tree.vertices) if isempty(tree.children[i])]
+
+function _validate_murray_params(terminal_diameter_cm::Float64, gamma::Float64,
+                                 proximal_gamma::Float64, transition_diameter_cm::Float64)
+    terminal_diameter_cm > 0.0 || error("terminal_diameter_cm must be positive")
+    gamma > 0.0 || error("gamma must be positive")
+    proximal_gamma > 0.0 || error("proximal_gamma must be positive")
+    (transition_diameter_cm > 0.0 || isinf(transition_diameter_cm)) ||
+        error("transition_diameter_cm must be positive or Inf")
+    return nothing
+end
+
+function _use_piecewise_murray(terminal_diameter_cm::Float64, transition_diameter_cm::Float64)
+    return isfinite(transition_diameter_cm)
+end
+
+function _effective_murray_transition(terminal_diameter_cm::Float64, transition_diameter_cm::Float64)
+    return max(terminal_diameter_cm, transition_diameter_cm)
+end
+
+"""
+    murray_diameter_from_terminals(n, terminal_diameter_cm; gamma=3.0,
+        proximal_gamma=gamma, transition_diameter_cm=Inf)
+
+Return the diameter implied by `n` terminal beds. Defaults recover the usual
+single-exponent Murray relation. When `transition_diameter_cm` is finite and
+at least as large as `terminal_diameter_cm`, diameters up to the transition use
+`gamma`; larger conduit/proximal diameters use `proximal_gamma`, continuously.
+"""
+function murray_diameter_from_terminals(n::Real, terminal_diameter_cm::Float64;
+        gamma::Float64=3.0,
+        proximal_gamma::Float64=gamma,
+        transition_diameter_cm::Float64=Inf)
+    _validate_murray_params(terminal_diameter_cm, gamma, proximal_gamma, transition_diameter_cm)
+    n_float = Float64(n)
+    n_float <= 0.0 && return 0.0
+    if !_use_piecewise_murray(terminal_diameter_cm, transition_diameter_cm)
+        return terminal_diameter_cm * n_float^(1.0 / gamma)
+    end
+    effective_transition_cm = _effective_murray_transition(terminal_diameter_cm, transition_diameter_cm)
+    n_transition = (effective_transition_cm / terminal_diameter_cm)^gamma
+    if n_float <= n_transition
+        return terminal_diameter_cm * n_float^(1.0 / gamma)
+    end
+    return effective_transition_cm * (n_float / n_transition)^(1.0 / proximal_gamma)
+end
+
+"""
+    murray_terminal_capacity(diameter_cm, terminal_diameter_cm; gamma=3.0,
+        proximal_gamma=gamma, transition_diameter_cm=Inf)
+
+Inverse of `murray_diameter_from_terminals`: estimate how many terminal beds a
+vessel of `diameter_cm` can support under the selected diameter law.
+"""
+function murray_terminal_capacity(diameter_cm::Float64, terminal_diameter_cm::Float64;
+        gamma::Float64=3.0,
+        proximal_gamma::Float64=gamma,
+        transition_diameter_cm::Float64=Inf)
+    _validate_murray_params(terminal_diameter_cm, gamma, proximal_gamma, transition_diameter_cm)
+    diameter_cm <= 0.0 && return 0.0
+    if !_use_piecewise_murray(terminal_diameter_cm, transition_diameter_cm) ||
+            diameter_cm <= _effective_murray_transition(terminal_diameter_cm, transition_diameter_cm)
+        return (diameter_cm / terminal_diameter_cm)^gamma
+    end
+    effective_transition_cm = _effective_murray_transition(terminal_diameter_cm, transition_diameter_cm)
+    n_transition = (effective_transition_cm / terminal_diameter_cm)^gamma
+    return n_transition * (diameter_cm / effective_transition_cm)^proximal_gamma
+end
 
 # ── Path helpers ──
 
@@ -228,11 +308,31 @@ function _anchor_touches_xcat(tree::GrowthTree, vertex::Int)
     return false
 end
 
-function _add_branch_path!(tree::GrowthTree, anchor_vertex::Int, path_points::Vector{SVector{3, Float64}}; gamma::Float64=3.0, max_branch_length_cm::Float64=Inf, max_segment_length_cm::Float64=0.1, domain=nothing, max_anchor_gap_cm::Float64=-1.0)
+function _add_branch_path!(tree::GrowthTree, anchor_vertex::Int, path_points::Vector{SVector{3, Float64}};
+        gamma::Float64=3.0,
+        proximal_gamma::Float64=gamma,
+        transition_diameter_cm::Float64=Inf,
+        max_branch_length_cm::Float64=Inf,
+        max_segment_length_cm::Float64=0.1,
+        domain=nothing,
+        max_anchor_gap_cm::Float64=-1.0)
     isempty(path_points) && return false
 
     # Murray budget check FIRST — refuse if any XCAT ancestor would over-allocate.
-    _can_add_terminal_at_anchor(tree, anchor_vertex; gamma=gamma) || return false
+    _can_add_terminal_at_anchor(tree, anchor_vertex;
+        gamma=gamma,
+        proximal_gamma=proximal_gamma,
+        transition_diameter_cm=transition_diameter_cm) || return false
+
+    if isempty(tree.children[anchor_vertex]) && tree.incoming_segment[anchor_vertex] != 0
+        # Growing from an existing terminal should form a bifurcation, while
+        # keeping the old terminal as an explicit child/outlet for topology and
+        # downstream flow export.
+        incoming = tree.incoming_segment[anchor_vertex]
+        a = tree.vertices[tree.segment_start[incoming]]
+        b = tree.vertices[tree.segment_end[incoming]]
+        anchor_vertex = _split_segment!(tree, incoming, a + 0.8 * (b - a))
+    end
 
     anchor_point = tree.vertices[anchor_vertex]
     local_pts = copy(path_points)
@@ -294,7 +394,11 @@ function _add_branch_path!(tree::GrowthTree, anchor_vertex::Int, path_points::Ve
 
     # Cascade subtree_terminal_count upward; for grown segments along the path,
     # recompute diameter via strict Murray d = d_term × N^(1/γ).
-    _strict_murray_propagate!(tree, anchor_vertex; gamma=gamma, added=1)
+    _strict_murray_propagate!(tree, anchor_vertex;
+        gamma=gamma,
+        added=1,
+        proximal_gamma=proximal_gamma,
+        transition_diameter_cm=transition_diameter_cm)
     return true
 end
 
@@ -498,16 +602,28 @@ at every junction in the entire tree.
 function subdivide_terminals!(tree::GrowthTree;
         target_diameter_cm::Float64,
         gamma::Float64=3.0,
+        proximal_gamma::Float64=gamma,
+        transition_diameter_cm::Float64=Inf,
         branch_half_angle::Float64=0.4,
         ld_ratio::Float64=12.0,
         max_ld_ratio::Float64=25.0,
         clip_below_diameter_cm::Float64=0.0,
+        subdivide_xcat_terminals::Bool=true,
         domain::Union{Nothing, VoxelShellDomain}=nothing)
 
     target_diameter_cm >= tree.terminal_diameter_cm && return nothing
 
-    # Collect current terminals before we start adding new ones
-    terminals = _branch_terminals(tree)
+    # Collect current terminals before we start adding new ones. For organ
+    # workflows with fixed XCAT conduit seeds, callers can leave pure XCAT
+    # outlets unsubdivided so final capillary count is controlled by predicted
+    # terminal beds rather than by every anatomical centerline endpoint.
+    terminals_all = _branch_terminals(tree)
+    terminals = Int[]
+    for tip_v in terminals_all
+        seg = tree.incoming_segment[tip_v]
+        seg == 0 && continue
+        (subdivide_xcat_terminals || !tree.is_xcat[seg]) && push!(terminals, tip_v)
+    end
     n_before = length(tree.vertices)
     rng = Random.MersenneTwister(hash(tree.name))
     clipped = Ref(0)  # count of sub-branches rejected for leaving domain
@@ -531,7 +647,11 @@ function subdivide_terminals!(tree::GrowthTree;
     end
 
     # Recompute terminal counts and diameters for the ENTIRE tree
-    _recompute_all_murray!(tree; target_diameter_cm=target_diameter_cm, gamma=gamma)
+    _recompute_all_murray!(tree;
+        target_diameter_cm=target_diameter_cm,
+        gamma=gamma,
+        proximal_gamma=proximal_gamma,
+        transition_diameter_cm=transition_diameter_cm)
 
     n_after = length(tree.vertices)
     n_new_terminals = length(_branch_terminals(tree))
@@ -736,7 +856,11 @@ end
 Bottom-up pass: recompute subtree_terminal_count and segment diameters for the
 entire tree using `target_diameter_cm` as the new terminal diameter.
 """
-function _recompute_all_murray!(tree::GrowthTree; target_diameter_cm::Float64, gamma::Float64=3.0)
+function _recompute_all_murray!(tree::GrowthTree;
+        target_diameter_cm::Float64,
+        gamma::Float64=3.0,
+        proximal_gamma::Float64=gamma,
+        transition_diameter_cm::Float64=Inf)
     nv = length(tree.vertices)
 
     # Reset all counts
@@ -785,8 +909,12 @@ function _recompute_all_murray!(tree::GrowthTree; target_diameter_cm::Float64, g
             # For grown/subdivided segments (is_xcat=false), murray_d is the
             # authoritative value by design, so max() just recovers that.
             n = tree.subtree_terminal_count[v]
-            murray_d = target_diameter_cm * n^(1.0 / gamma)
-            tree.segment_diameter_cm[seg] = max(tree.segment_diameter_cm[seg], murray_d)
+            murray_d = murray_diameter_from_terminals(n, target_diameter_cm;
+                gamma=gamma,
+                proximal_gamma=proximal_gamma,
+                transition_diameter_cm=transition_diameter_cm)
+            tree.segment_diameter_cm[seg] = tree.is_xcat[seg] ?
+                max(tree.segment_diameter_cm[seg], murray_d) : murray_d
         end
     end
 

@@ -1,12 +1,12 @@
 """
     thigh_xcat_right_100um_test.jl
 
-Build a right-thigh muscle mask from XCAT color-code output that contains both
-legs, keep only the image half containing `leg_right`, and run a 100 um vessel
-growth test using the richer femoral viewer.
+Legacy raw-label right-thigh test helper. Direct execution is disabled:
+current right-leg XCAT workflows are NRB-input-only. Helper functions remain
+available to the NRB runner.
 
 Usage:
-    julia --project=. examples/thigh_xcat_right_100um_test.jl [raw_path] [organ_ids] [xcat_log] [max_branches] [block_size] [terminal_um]
+    julia --project=. examples/right_leg_xcat_50um_gpu.jl [terminal_um] [output_dir] [nrb_path] ...
 """
 
 include(joinpath(@__DIR__, "thigh_raw_nrrd_femoral_smoke.jl"))
@@ -299,6 +299,5 @@ function main_xcat_right()
 end
 
 if abspath(PROGRAM_FILE) == @__FILE__
-    main_xcat_right()
+    legacy_raw_entrypoint_error("examples/thigh_xcat_right_100um_test.jl")
 end
-

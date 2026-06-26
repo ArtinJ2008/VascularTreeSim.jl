@@ -315,6 +315,190 @@ function _enforce_component_reachability!(global_min_dist::Vector{Float64}, owne
     return corrected, unclaimed
 end
 
+function _tree_can_reach_point(ti::Int, idx::Int,
+                               point_components::Vector{Int},
+                               tree_components::Vector{Set{Int}})
+    isempty(point_components) && return true
+    1 <= ti <= length(tree_components) || return false
+    return point_components[idx] in tree_components[ti]
+end
+
+function _territory_floor_counts(branch_names::Vector{String},
+                                 branch_caps::Dict{String, Int},
+                                 n_points::Int,
+                                 min_initial_territory_fraction::Float64,
+                                 max_initial_territory_points_per_tree::Int)
+    n_trees = length(branch_names)
+    min_counts = zeros(Int, n_trees)
+    n_points <= 0 && return min_counts
+    frac = clamp(min_initial_territory_fraction, 0.0, 1.0)
+    frac <= 0.0 && return min_counts
+    max_per_tree = max(max_initial_territory_points_per_tree, 0)
+    max_per_tree == 0 && return min_counts
+
+    active = [ti for ti in 1:n_trees if get(branch_caps, branch_names[ti], 0) > 0]
+    isempty(active) && return min_counts
+    total_cap = sum(get(branch_caps, branch_names[ti], 0) for ti in active)
+    for ti in active
+        cap = get(branch_caps, branch_names[ti], 0)
+        expected = total_cap > 0 ? n_points * cap / total_cap : n_points / length(active)
+        floor_count = floor(Int, frac * expected)
+        if n_points >= length(active)
+            floor_count = max(floor_count, 1)
+        end
+        min_counts[ti] = min(cap, max_per_tree, floor_count)
+    end
+
+    while sum(min_counts) > n_points
+        ti = argmax(min_counts)
+        min_counts[ti] -= 1
+    end
+    return min_counts
+end
+
+function _redistribute_branch_caps_by_territory!(branch_caps::Dict{String, Int},
+                                                 branch_names::Vector{String},
+                                                 owner_counts::Vector{Int},
+                                                 total_added::Dict{String, Int};
+                                                 total_budget::Int,
+                                                 weights::Vector{Float64})
+    total_budget = max(total_budget, 0)
+    n_trees = length(branch_names)
+    n_trees == 0 && return false
+    length(owner_counts) == n_trees || error("owner_counts length does not match branch_names")
+    length(weights) == n_trees || error("weights length does not match branch_names")
+
+    old_caps = [get(branch_caps, name, 0) for name in branch_names]
+    added = [get(total_added, name, 0) for name in branch_names]
+    capacity = [max(owner_counts[i], added[i]) for i in 1:n_trees]
+    floors = copy(added)
+    required = sum(floors)
+    budget = max(total_budget, required)
+    residual = [max(capacity[i] - floors[i], 0) for i in 1:n_trees]
+    allocatable = min(budget - required, sum(residual))
+    new_caps = copy(floors)
+
+    if allocatable > 0
+        weighted = [residual[i] * max(weights[i], 1e-12) for i in 1:n_trees]
+        total_weight = sum(weighted)
+        total_weight <= 0.0 && (weighted = Float64.(residual); total_weight = sum(weighted))
+        if total_weight > 0.0
+            shares = weighted ./ total_weight .* allocatable
+            additions = min.(floor.(Int, shares), residual)
+            remaining = allocatable - sum(additions)
+            order = sortperm(collect(1:n_trees); by=i -> shares[i] - floor(shares[i]), rev=true)
+            while remaining > 0 && any(additions .< residual)
+                for idx in order
+                    additions[idx] >= residual[idx] && continue
+                    additions[idx] += 1
+                    remaining -= 1
+                    remaining <= 0 && break
+                end
+            end
+            new_caps .+= additions
+        end
+    end
+
+    changed = false
+    for (i, name) in enumerate(branch_names)
+        if old_caps[i] != new_caps[i]
+            branch_caps[name] = new_caps[i]
+            changed = true
+        end
+    end
+    return changed
+end
+
+function _push_closest_candidate!(candidates::Vector{Tuple{Float64, Int, Float64}},
+                                  item::Tuple{Float64, Int, Float64},
+                                  limit::Int)
+    limit <= 0 && return nothing
+    if length(candidates) < limit
+        push!(candidates, item)
+        return nothing
+    end
+    worst_pos = 1
+    worst_score = candidates[1][1]
+    @inbounds for pos in 2:length(candidates)
+        score = candidates[pos][1]
+        if score > worst_score
+            worst_score = score
+            worst_pos = pos
+        end
+    end
+    if item[1] < worst_score
+        candidates[worst_pos] = item
+    end
+    return nothing
+end
+
+function _enforce_initial_territory_floor!(global_min_dist::Vector{Float64},
+                                           owner::AbstractVector{<:Integer},
+                                           points_cm::Matrix{Float64},
+                                           point_components::Vector{Int},
+                                           tree_components::Vector{Set{Int}},
+                                           seg_indices::Dict{String, SegmentSpatialIndex},
+                                           trees::Dict{String, GrowthTree},
+                                           branch_names::Vector{String},
+                                           territory_w_arr::Vector{Float64},
+                                           min_counts::Vector{Int})
+    n_trees = length(branch_names)
+    counts = zeros(Int, n_trees)
+    @inbounds for ti0 in owner
+        ti = Int(ti0)
+        1 <= ti <= n_trees && (counts[ti] += 1)
+    end
+
+    added_by_tree = zeros(Int, n_trees)
+    total_reassigned = 0
+    total_unfilled = 0
+    @inbounds for ti in 1:n_trees
+        needed = min_counts[ti] - counts[ti]
+        needed <= 0 && continue
+        tree = trees[branch_names[ti]]
+        seg_idx = seg_indices[branch_names[ti]]
+        candidate_limit = min(size(points_cm, 1), max(needed * 16, needed, 64))
+        candidates = Tuple{Float64, Int, Float64}[]
+        sizehint!(candidates, candidate_limit)
+        for idx in axes(points_cm, 1)
+            Int(owner[idx]) == ti && continue
+            old = Int(owner[idx])
+            if 1 <= old <= n_trees && counts[old] <= min_counts[old]
+                continue
+            end
+            _tree_can_reach_point(ti, idx, point_components, tree_components) || continue
+            d_raw = if isempty(tree.segment_start)
+                p = SVector(points_cm[idx, 1], points_cm[idx, 2], points_cm[idx, 3])
+                norm(p - tree.vertices[tree.root_vertex])
+            else
+                _indexed_segment_distance(seg_idx, points_cm[idx, 1], points_cm[idx, 2], points_cm[idx, 3])
+            end
+            isfinite(d_raw) || continue
+            d_eff = d_raw / territory_w_arr[ti]
+            _push_closest_candidate!(candidates, (d_eff, idx, d_eff), candidate_limit)
+        end
+
+        sort!(candidates, by=first)
+        for (_, idx, d_eff) in candidates
+            needed <= 0 && break
+            Int(owner[idx]) == ti && continue
+            old = Int(owner[idx])
+            if 1 <= old <= n_trees
+                counts[old] <= min_counts[old] && continue
+                counts[old] -= 1
+            end
+            owner[idx] = ti
+            global_min_dist[idx] = d_eff
+            counts[ti] += 1
+            added_by_tree[ti] += 1
+            total_reassigned += 1
+            needed -= 1
+        end
+        total_unfilled += max(needed, 0)
+    end
+    return total_reassigned, total_unfilled, added_by_tree, counts
+end
+
 function _round_distance_stats!(raw_dists::Vector{Float64},
                                 owner_counts::Vector{Int},
                                 per_tree_dists::Vector{Vector{Float64}},
@@ -453,15 +637,82 @@ function _growth_vertex_path_resistances(tree::GrowthTree;
     return path_resistance
 end
 
+function _growth_vertex_path_lengths(tree::GrowthTree)
+    path_length = zeros(Float64, length(tree.vertices))
+    roots = [v for v in eachindex(tree.vertices) if tree.parent_vertex[v] == 0]
+    for root in roots
+        stack = copy(tree.children[root])
+        while !isempty(stack)
+            v = pop!(stack)
+            seg = tree.incoming_segment[v]
+            if seg != 0
+                parent = tree.segment_start[seg]
+                a = tree.vertices[parent]
+                b = tree.vertices[v]
+                path_length[v] = path_length[parent] + norm(b - a)
+            end
+            append!(stack, tree.children[v])
+        end
+    end
+    return path_length
+end
+
+function _growth_vertex_branchpoint_generations(tree::GrowthTree)
+    branch_gen = zeros(Int, length(tree.vertices))
+    roots = [v for v in eachindex(tree.vertices) if tree.parent_vertex[v] == 0]
+    for root in roots
+        stack = copy(tree.children[root])
+        while !isempty(stack)
+            v = pop!(stack)
+            parent = tree.parent_vertex[v]
+            parent_gen = parent == 0 ? 0 : branch_gen[parent]
+            branch_gen[v] = parent_gen == 0 ? 1 :
+                parent_gen + (length(tree.children[parent]) == 1 ? 0 : 1)
+            append!(stack, tree.children[v])
+        end
+    end
+    return branch_gen
+end
+
+function _growth_path_length_to_vertex(tree::GrowthTree, vertex::Int)
+    path_length = 0.0
+    v = vertex
+    while v != 0
+        seg = tree.incoming_segment[v]
+        seg == 0 && break
+        a = tree.vertices[tree.segment_start[seg]]
+        b = tree.vertices[tree.segment_end[seg]]
+        path_length += norm(b - a)
+        v = tree.parent_vertex[v]
+    end
+    return path_length
+end
+
+function _growth_branchpoint_generation_to_vertex(tree::GrowthTree, vertex::Int)
+    branch_gen = 0
+    v = vertex
+    while v != 0
+        parent = tree.parent_vertex[v]
+        parent == 0 && break
+        branch_gen == 0 && (branch_gen = 1)
+        length(tree.children[parent]) > 1 && (branch_gen += 1)
+        v = parent
+    end
+    return max(branch_gen, vertex == tree.root_vertex ? 0 : 1)
+end
+
 function _candidate_anchor_info(tree::GrowthTree, seg_idx::SegmentSpatialIndex,
                                 point::SVector{3, Float64},
-                                vertex_path_resistance::Vector{Float64};
+                                vertex_path_resistance::Vector{Float64},
+                                vertex_path_length::Vector{Float64},
+                                vertex_branch_generation::Vector{Int};
                                 use_indexed_anchor::Bool=false,
                                 split_range=(0.2, 0.8),
                                 viscosity_poise::Float64=0.035)
     if isempty(tree.segment_start)
         root = tree.root_vertex
-        return tree.vertices[root], vertex_path_resistance[root]
+        return tree.vertices[root], vertex_path_resistance[root],
+            vertex_path_length[root], vertex_branch_generation[root]
     end
 
     seg_id, t, proj, _ = use_indexed_anchor ?
@@ -469,7 +720,8 @@ function _candidate_anchor_info(tree::GrowthTree, seg_idx::SegmentSpatialIndex,
         _nearest_tree_segment_projection(tree, point)
     if seg_id == 0
         root = tree.root_vertex
-        return tree.vertices[root], vertex_path_resistance[root]
+        return tree.vertices[root], vertex_path_resistance[root],
+            vertex_path_length[root], vertex_branch_generation[root]
     end
 
     start_v = tree.segment_start[seg_id]
@@ -479,13 +731,17 @@ function _candidate_anchor_info(tree::GrowthTree, seg_idx::SegmentSpatialIndex,
         partial_len = norm(proj - a)
         partial_r = _growth_poiseuille_resistance(partial_len, tree.segment_diameter_cm[seg_id];
             viscosity_poise=viscosity_poise)
-        return proj, vertex_path_resistance[start_v] + partial_r
+        return proj,
+            vertex_path_resistance[start_v] + partial_r,
+            vertex_path_length[start_v] + partial_len,
+            vertex_branch_generation[start_v]
     end
 
     ds = norm(point - tree.vertices[start_v])
     de = norm(point - tree.vertices[end_v])
     vid = ds <= de ? start_v : end_v
-    return tree.vertices[vid], vertex_path_resistance[vid]
+    return tree.vertices[vid], vertex_path_resistance[vid],
+        vertex_path_length[vid], vertex_branch_generation[vid]
 end
 
 function _rank_frontiers_by_hydraulic_score(frontiers::Vector{Int}, tree::GrowthTree,
@@ -499,21 +755,29 @@ function _rank_frontiers_by_hydraulic_score(frontiers::Vector{Int}, tree::Growth
                                             hydraulic_cost_weight::Float64,
                                             hydraulic_existing_path_weight::Float64,
                                             hydraulic_reference_resistance::Float64,
+                                            path_length_cost_weight::Float64,
+                                            branchpoint_depth_cost_weight::Float64,
+                                            hydraulic_reference_length_cm::Float64,
                                             blood_viscosity_poise::Float64,
                                             use_indexed_anchor::Bool)
     rank_candidate_factor <= 0 && return frontiers
-    hydraulic_cost_weight <= 0.0 && return frontiers
+    (hydraulic_cost_weight <= 0.0 &&
+        path_length_cost_weight <= 0.0 &&
+        branchpoint_depth_cost_weight <= 0.0) && return frontiers
     hydraulic_reference_resistance <= 0.0 && return frontiers
     isempty(frontiers) && return frontiers
 
     pool_n = min(length(frontiers), max(batch * rank_candidate_factor, batch))
     vertex_r = _growth_vertex_path_resistances(tree; viscosity_poise=blood_viscosity_poise)
+    vertex_len = _growth_vertex_path_lengths(tree)
+    vertex_branch_gen = _growth_vertex_branchpoint_generations(tree)
     scored = Vector{Tuple{Float64, Float64, Int}}()
     sizehint!(scored, pool_n)
     @inbounds for pos in 1:pool_n
         idx = frontiers[pos]
         p = SVector(points_cm[idx, 1], points_cm[idx, 2], points_cm[idx, 3])
-        anchor_point, anchor_r = _candidate_anchor_info(tree, seg_idx, p, vertex_r;
+        anchor_point, anchor_r, anchor_len, anchor_branch_gen = _candidate_anchor_info(
+            tree, seg_idx, p, vertex_r, vertex_len, vertex_branch_gen;
             use_indexed_anchor=use_indexed_anchor,
             viscosity_poise=blood_viscosity_poise)
         route_len = max(norm(p - anchor_point), global_min_dist[idx] * weight)
@@ -522,8 +786,14 @@ function _rank_frontiers_by_hydraulic_score(frontiers::Vector{Int}, tree::Growth
         new_branch_rel = new_branch_r / hydraulic_reference_resistance
         anchor_rel = anchor_r / hydraulic_reference_resistance
         weighted_cost_rel = new_branch_rel + hydraulic_existing_path_weight * anchor_rel
+        terminal_path_len = anchor_len + route_len
+        branch_depth = max(anchor_branch_gen + 1, 1)
         coverage_gain_cm = max(global_min_dist[idx] * weight - effective_supply_radius_cm, 0.0)
-        score = coverage_gain_cm / (1.0 + hydraulic_cost_weight * log1p(max(weighted_cost_rel, 0.0)))
+        score = coverage_gain_cm / (
+            1.0 +
+            hydraulic_cost_weight * log1p(max(weighted_cost_rel, 0.0)) +
+            path_length_cost_weight * terminal_path_len / max(hydraulic_reference_length_cm, eps(Float64)) +
+            branchpoint_depth_cost_weight * branch_depth)
         push!(scored, (score, coverage_gain_cm, idx))
     end
     sort!(scored, by=x -> (x[1], x[2]), rev=true)
@@ -601,8 +871,11 @@ function grow_trees_mcp!(trees::Dict{String, GrowthTree}, domain;
         effective_supply_radius_cm::Float64=1.25e-3,
         capillary_diameter_cm::Float64=8e-4,
         max_new_branches_per_tree::Union{Int, Dict{String, Int}}=120,
+        adaptive_branch_caps::Bool=false,
         graph_neighbors::Int=10,
         gamma::Float64=3.0,
+        proximal_gamma::Float64=gamma,
+        murray_transition_diameter_cm::Float64=Inf,
         min_frontier_separation_cm::Float64=0.12,
         max_path_nodes::Int=20,
         target_p95_distance_cm::Float64=Inf,
@@ -631,11 +904,19 @@ function grow_trees_mcp!(trees::Dict{String, GrowthTree}, domain;
         hydraulic_rank_candidate_factor::Int=0,
         hydraulic_reference_length_cm::Float64=1.0,
         hydraulic_existing_path_weight::Float64=0.0,
+        path_length_cost_weight::Float64=0.0,
+        branchpoint_depth_cost_weight::Float64=0.0,
         min_hydraulic_score_cm::Float64=0.0,
         max_new_branch_resistance_rel::Float64=Inf,
         max_terminal_path_resistance_rel::Float64=Inf,
+        max_terminal_path_length_cm::Float64=Inf,
+        max_branchpoint_generation::Int=typemax(Int),
         blood_viscosity_poise::Float64=0.035,
+        min_initial_territory_fraction::Float64=0.0,
+        max_initial_territory_points_per_tree::Int=1024,
         precompute_target_graph_indices::Bool=false,
+        min_graph_largest_component_fraction::Float64=0.0,
+        max_unclaimed_target_fraction::Float64=1.0,
         progress_csv_path::Union{Nothing, AbstractString}=nothing,
         checkpoint_dir::Union{Nothing, AbstractString}=nothing,
         checkpoint_interval_seconds::Real=Inf,
@@ -672,7 +953,7 @@ function grow_trees_mcp!(trees::Dict{String, GrowthTree}, domain;
         dir = dirname(progress_csv)
         !isempty(dir) && mkpath(dir)
         open(progress_csv, "w") do io
-            println(io, "round,round_seconds,total_added,global_p95_cm,global_max_cm,unclaimed_targets,per_tree_added,per_tree_p95,territory_counts,stall_rounds,hydraulic_rejected,new_branch_resistance_rel_p95,terminal_path_resistance_rel_p95")
+            println(io, "round,round_seconds,total_added,global_p95_cm,global_max_cm,unclaimed_targets,per_tree_added,per_tree_p95,territory_counts,stall_rounds,hydraulic_rejected,new_branch_resistance_rel_p95,terminal_path_resistance_rel_p95,branch_cap_total,branch_cap_unfilled")
         end
     end
     branch_caps = Dict{String, Int}()
@@ -682,6 +963,8 @@ function grow_trees_mcp!(trees::Dict{String, GrowthTree}, domain;
             max_new_branches_per_tree
         branch_caps[name] = max(0, cap)
     end
+    initial_branch_caps = copy(branch_caps)
+    branch_cap_budget = sum(values(initial_branch_caps))
 
     # Normalize per-tree growth weights. Each tree's per-round batch is
     # scaled by its normalized weight so that the total number of frontiers
@@ -732,24 +1015,56 @@ function grow_trees_mcp!(trees::Dict{String, GrowthTree}, domain;
     hydraulic_cost_weight = max(hydraulic_cost_weight, 0.0)
     hydraulic_rank_candidate_factor = max(hydraulic_rank_candidate_factor, 0)
     hydraulic_existing_path_weight = max(hydraulic_existing_path_weight, 0.0)
+    path_length_cost_weight = max(path_length_cost_weight, 0.0)
+    branchpoint_depth_cost_weight = max(branchpoint_depth_cost_weight, 0.0)
     min_hydraulic_score_cm = max(min_hydraulic_score_cm, 0.0)
+    max_branchpoint_generation = max(max_branchpoint_generation, 1)
+    min_initial_territory_fraction = clamp(min_initial_territory_fraction, 0.0, 1.0)
+    max_initial_territory_points_per_tree = max(max_initial_territory_points_per_tree, 0)
+    min_graph_largest_component_fraction = clamp(min_graph_largest_component_fraction, 0.0, 1.0)
+    max_unclaimed_target_fraction = clamp(max_unclaimed_target_fraction, 0.0, 1.0)
     hydraulic_reference_length_cm > 0.0 || error("hydraulic_reference_length_cm must be positive")
     blood_viscosity_poise > 0.0 || error("blood_viscosity_poise must be positive")
+    murray_terminal_capacity(capillary_diameter_cm, capillary_diameter_cm;
+        gamma=gamma,
+        proximal_gamma=proximal_gamma,
+        transition_diameter_cm=murray_transition_diameter_cm)
+    if isfinite(murray_transition_diameter_cm)
+        effective_transition = max(capillary_diameter_cm, murray_transition_diameter_cm)
+        println("[growth] diameter law: distal_gamma=$(gamma) proximal_gamma=$(proximal_gamma) transition=$(round(effective_transition * 1e4; digits=3)) um")
+        flush(stdout)
+    end
     hydraulic_reference_resistance = _growth_poiseuille_resistance(
         hydraulic_reference_length_cm, capillary_diameter_cm;
         viscosity_poise=blood_viscosity_poise)
     hydraulic_guards_enabled =
         hydraulic_cost_weight > 0.0 ||
+        path_length_cost_weight > 0.0 ||
+        branchpoint_depth_cost_weight > 0.0 ||
         min_hydraulic_score_cm > 0.0 ||
         isfinite(max_new_branch_resistance_rel) ||
-        isfinite(max_terminal_path_resistance_rel)
+        isfinite(max_terminal_path_resistance_rel) ||
+        isfinite(max_terminal_path_length_cm) ||
+        max_branchpoint_generation < typemax(Int)
     if hydraulic_guards_enabled
-        println("[growth] hydraulic guards: weight=$(hydraulic_cost_weight) rank_factor=$(hydraulic_rank_candidate_factor) reference_length_cm=$(hydraulic_reference_length_cm) existing_path_weight=$(hydraulic_existing_path_weight) min_score_cm=$(min_hydraulic_score_cm) max_new_rel=$(max_new_branch_resistance_rel) max_terminal_rel=$(max_terminal_path_resistance_rel)")
+        println("[growth] hydraulic/path guards: weight=$(hydraulic_cost_weight) rank_factor=$(hydraulic_rank_candidate_factor) reference_length_cm=$(hydraulic_reference_length_cm) existing_path_weight=$(hydraulic_existing_path_weight) path_length_weight=$(path_length_cost_weight) branchpoint_depth_weight=$(branchpoint_depth_cost_weight) min_score_cm=$(min_hydraulic_score_cm) max_new_rel=$(max_new_branch_resistance_rel) max_terminal_rel=$(max_terminal_path_resistance_rel) max_path_cm=$(max_terminal_path_length_cm) max_branchpoint_generation=$(max_branchpoint_generation)")
         flush(stdout)
     end
-    hydraulic_ranking_enabled = hydraulic_cost_weight > 0.0 && hydraulic_rank_candidate_factor > 0
+    hydraulic_ranking_enabled = (
+        hydraulic_cost_weight > 0.0 ||
+        path_length_cost_weight > 0.0 ||
+        branchpoint_depth_cost_weight > 0.0) &&
+        hydraulic_rank_candidate_factor > 0
     hydraulic_ranking_enabled && frontier_candidate_factor <= 1 &&
         @warn "Hydraulic candidate ranking works best with frontier_candidate_factor > 1" frontier_candidate_factor hydraulic_rank_candidate_factor
+    if min_initial_territory_fraction > 0.0 && max_initial_territory_points_per_tree > 0
+        println("[growth] initial territory bootstrap: fraction=$(min_initial_territory_fraction) max_points_per_tree=$(max_initial_territory_points_per_tree)")
+        flush(stdout)
+    end
+    if adaptive_branch_caps
+        println("[growth] adaptive branch caps enabled: total_budget=$(branch_cap_budget)")
+        flush(stdout)
+    end
 
     # Build segment spatial indices for each tree
     seg_indices = Dict{String, SegmentSpatialIndex}()
@@ -773,6 +1088,12 @@ function grow_trees_mcp!(trees::Dict{String, GrowthTree}, domain;
         graph_component, graph_component_count = graph_connected_components(graph)
         graph_diag = _graph_component_diagnostics(graph, graph_component, graph_component_count)
         println("[growth] graph connectivity: components=$(graph_diag.components) largest=$(graph_diag.largest_component_nodes)/$(length(graph.points)) ($(round(100 * graph_diag.largest_component_fraction; digits=2))%) isolated=$(graph_diag.isolated_nodes) edges=$(graph_diag.edges)")
+        if graph_diag.largest_component_fraction < min_graph_largest_component_fraction
+            error("[growth] route graph failed connectivity guard: largest component fraction " *
+                  "$(round(graph_diag.largest_component_fraction; digits=4)) < " *
+                  "$(round(min_graph_largest_component_fraction; digits=4)). " *
+                  "Check route mask connectivity, graph cell size, graph neighbors, and route dilation before running subdivision.")
+        end
         if graph_component_count <= 1
             component_reachability = false
             println("[growth] graph components=1 reachability filter not needed ($(round(time()-t_comp; digits=2))s)")
@@ -861,6 +1182,35 @@ function grow_trees_mcp!(trees::Dict{String, GrowthTree}, domain;
 
     # Points with owner=0 (unclaimed — shouldn't happen after init) use raw=Inf.
 
+    territory_floor_counts = _territory_floor_counts(branch_names, branch_caps, n_points,
+        min_initial_territory_fraction, max_initial_territory_points_per_tree)
+    territory_bootstrap_added = zeros(Int, n_trees)
+    territory_floor_maintenance_added = zeros(Int, n_trees)
+    territory_floor_active = any(x -> x > 0, territory_floor_counts)
+    if territory_floor_active
+        reassigned, unfilled, added_by_tree, boot_counts = _enforce_initial_territory_floor!(
+            global_min_dist, owner, points_cm, point_components, tree_components,
+            seg_indices, trees, branch_names, territory_w_arr, territory_floor_counts)
+        territory_bootstrap_added = added_by_tree
+        if reassigned > 0 && use_gpu && gpu_state !== nothing
+            _gpu_upload_distances!(gpu_state, global_min_dist, owner)
+        end
+        floor_summary = join([
+            "$(branch_names[ti])=$(boot_counts[ti])/$(territory_floor_counts[ti])"
+            for ti in 1:n_trees if territory_floor_counts[ti] > 0
+        ], " ")
+        println("[growth] initial territory bootstrap reassigned=$(reassigned) unfilled=$(unfilled) floor=[$(floor_summary)]")
+        flush(stdout)
+    end
+    initial_unclaimed = count(==(0), owner)
+    initial_unclaimed_fraction = n_points == 0 ? 0.0 : initial_unclaimed / n_points
+    if initial_unclaimed_fraction > max_unclaimed_target_fraction
+        error("[growth] target reachability failed guard: unclaimed target fraction " *
+              "$(round(initial_unclaimed_fraction; digits=4)) > " *
+              "$(round(max_unclaimed_target_fraction; digits=4)). " *
+              "Most sampled targets are not reachable from any active seed through the route graph.")
+    end
+
     println("[growth] initial global distance scan: $(round(time()-t_init; digits=2))s  points=$(n_points)")
     flush(stdout)
     initial_owner_counts = zeros(Int, n_trees)
@@ -872,12 +1222,23 @@ function grow_trees_mcp!(trees::Dict{String, GrowthTree}, domain;
 
     # ── Competitive round-robin growth ──
     total_added = Dict(name => 0 for name in branch_names)
+    if adaptive_branch_caps
+        changed = _redistribute_branch_caps_by_territory!(
+            branch_caps, branch_names, initial_owner_counts, total_added;
+            total_budget=branch_cap_budget,
+            weights=norm_weights)
+        if changed
+            println("[growth] adaptive branch caps initial: " *
+                    join(["$(name)=$(branch_caps[name])" for name in branch_names], " "))
+            flush(stdout)
+        end
+    end
     round_num = 0
     best_p95 = Inf
     stall_rounds = 0
     max_stall_rounds = 20   # stop if p95 hasn't improved in this many rounds
     raw_dists = Vector{Float64}(undef, n_points)
-    owner_counts = zeros(Int, n_trees)
+    owner_counts = copy(initial_owner_counts)
     per_tree_dist_buffers = [Float64[] for _ in 1:n_trees]
     for buf in per_tree_dist_buffers
         sizehint!(buf, max(1, cld(n_points, max(n_trees, 1))))
@@ -916,6 +1277,13 @@ function grow_trees_mcp!(trees::Dict{String, GrowthTree}, domain;
             remaining = branch_caps[name] - total_added[name]
             round_batches[ti] = min(tree_to_batch[name], remaining)
         end
+        round_cap_total = sum(branch_caps[branch_names[ti]] for ti in 1:n_trees if round_batches[ti] > 0)
+        process_order = [ti for ti in 1:n_trees if round_batches[ti] > 0]
+        sort!(process_order; by=ti -> begin
+            cap = branch_caps[branch_names[ti]]
+            expected = round_cap_total > 0 ? n_points * cap / round_cap_total : 0.0
+            expected <= 0.0 ? -Inf : (expected - owner_counts[ti]) / max(expected, 1.0)
+        end, rev=true)
         round_frontiers = _choose_competitive_frontiers_by_tree(
             global_min_dist, owner, points_cm;
             max_targets_by_tree=round_batches,
@@ -924,7 +1292,8 @@ function grow_trees_mcp!(trees::Dict{String, GrowthTree}, domain;
             weights=territory_w_arr,
             candidate_factor=frontier_candidate_factor)
 
-        for (ti, name) in enumerate(branch_names)
+        for ti in process_order
+            name = branch_names[ti]
             tree_saturated[name] && continue
             total_added[name] >= branch_caps[name] && continue
             tree = trees[name]
@@ -943,6 +1312,9 @@ function grow_trees_mcp!(trees::Dict{String, GrowthTree}, domain;
                     hydraulic_cost_weight=hydraulic_cost_weight,
                     hydraulic_existing_path_weight=hydraulic_existing_path_weight,
                     hydraulic_reference_resistance=hydraulic_reference_resistance,
+                    path_length_cost_weight=path_length_cost_weight,
+                    branchpoint_depth_cost_weight=branchpoint_depth_cost_weight,
+                    hydraulic_reference_length_cm=hydraulic_reference_length_cm,
                     blood_viscosity_poise=blood_viscosity_poise,
                     use_indexed_anchor=use_indexed_anchor)
             end
@@ -1003,6 +1375,13 @@ function grow_trees_mcp!(trees::Dict{String, GrowthTree}, domain;
                     new_branch_rel = new_branch_resistance / hydraulic_reference_resistance
                     need_anchor_resistance = hydraulic_existing_path_weight > 0.0 ||
                         isfinite(max_terminal_path_resistance_rel)
+                    anchor_path_length_cm = (path_length_cost_weight > 0.0 ||
+                        isfinite(max_terminal_path_length_cm)) ?
+                        _growth_path_length_to_vertex(tree, anchor_vertex) : 0.0
+                    terminal_path_length_cm = anchor_path_length_cm + route_length
+                    branchpoint_generation = (branchpoint_depth_cost_weight > 0.0 ||
+                        max_branchpoint_generation < typemax(Int)) ?
+                        _growth_branchpoint_generation_to_vertex(tree, anchor_vertex) + 1 : 1
                     anchor_rel = need_anchor_resistance ?
                         _growth_path_resistance_to_vertex(tree, anchor_vertex;
                             viscosity_poise=blood_viscosity_poise) / hydraulic_reference_resistance :
@@ -1010,12 +1389,17 @@ function grow_trees_mcp!(trees::Dict{String, GrowthTree}, domain;
                     terminal_path_rel = anchor_rel + new_branch_rel
                     weighted_cost_rel = new_branch_rel + hydraulic_existing_path_weight * anchor_rel
                     coverage_gain_cm = max(global_min_dist[idx] * w_ti - effective_supply_radius_cm, 0.0)
-                    hydraulic_score_cm = coverage_gain_cm /
-                        (1.0 + hydraulic_cost_weight * log1p(max(weighted_cost_rel, 0.0)))
+                    hydraulic_score_cm = coverage_gain_cm / (
+                        1.0 +
+                        hydraulic_cost_weight * log1p(max(weighted_cost_rel, 0.0)) +
+                        path_length_cost_weight * terminal_path_length_cm / max(hydraulic_reference_length_cm, eps(Float64)) +
+                        branchpoint_depth_cost_weight * branchpoint_generation)
                     push!(round_new_branch_resistance_rel, new_branch_rel)
                     push!(round_terminal_path_resistance_rel, terminal_path_rel)
                     if new_branch_rel > max_new_branch_resistance_rel ||
                             terminal_path_rel > max_terminal_path_resistance_rel ||
+                            terminal_path_length_cm > max_terminal_path_length_cm ||
+                            branchpoint_generation > max_branchpoint_generation ||
                             hydraulic_score_cm < min_hydraulic_score_cm
                         hydraulic_rejected += 1
                         round_hydraulic_rejected += 1
@@ -1024,6 +1408,8 @@ function grow_trees_mcp!(trees::Dict{String, GrowthTree}, domain;
                 end
                 if _add_branch_path!(tree, anchor_vertex, path_points;
                         gamma=gamma,
+                        proximal_gamma=proximal_gamma,
+                        transition_diameter_cm=murray_transition_diameter_cm,
                         max_branch_length_cm=max_branch_length_cm,
                         max_segment_length_cm=max_segment_length_cm,
                         domain=domain, max_anchor_gap_cm=max_anchor_gap_cm)
@@ -1076,6 +1462,24 @@ function grow_trees_mcp!(trees::Dict{String, GrowthTree}, domain;
 
         # Status report (convert effective → raw for p95/max so physical
         # thresholds and stall detection remain in cm).
+        if territory_floor_active
+            reassigned, unfilled, added_by_tree, floor_counts_now = _enforce_initial_territory_floor!(
+                global_min_dist, owner, points_cm, point_components, tree_components,
+                seg_indices, trees, branch_names, territory_w_arr, territory_floor_counts)
+            territory_floor_maintenance_added .+= added_by_tree
+            if reassigned > 0 && use_gpu && gpu_state !== nothing
+                _gpu_upload_distances!(gpu_state, global_min_dist, owner)
+            end
+            if reassigned > 0 && (round_num <= 3 || round_num % 5 == 0)
+                floor_summary = join([
+                    "$(branch_names[ti])=$(floor_counts_now[ti])/$(territory_floor_counts[ti])"
+                    for ti in 1:n_trees if territory_floor_counts[ti] > 0
+                ], " ")
+                println("[growth] territory floor maintenance round=$(round_num) reassigned=$(reassigned) unfilled=$(unfilled) floor=[$(floor_summary)]")
+                flush(stdout)
+            end
+        end
+
         dist_stats = _round_distance_stats!(raw_dists, owner_counts, per_tree_dist_buffers,
             global_min_dist, owner, territory_w_arr)
         current_p50 = dist_stats.p50
@@ -1085,6 +1489,17 @@ function grow_trees_mcp!(trees::Dict{String, GrowthTree}, domain;
         last_tree_p50 = dist_stats.per_tree_p50
         last_tree_p95 = dist_stats.per_tree_p95
         last_tree_max = dist_stats.per_tree_max
+        if adaptive_branch_caps
+            changed = _redistribute_branch_caps_by_territory!(
+                branch_caps, branch_names, owner_counts, total_added;
+                total_budget=branch_cap_budget,
+                weights=norm_weights)
+            if changed && (round_num <= 3 || round_num % 5 == 0)
+                println("[growth] adaptive branch caps round=$(round_num): " *
+                        join(["$(name)=$(branch_caps[name])" for name in branch_names], " "))
+                flush(stdout)
+            end
+        end
 
         # Per-tree p95 + saturation update. Compute p95 over owned points
         # only, advance per-tree stall counter, mark tree saturated when its
@@ -1154,6 +1569,8 @@ function grow_trees_mcp!(trees::Dict{String, GrowthTree}, domain;
                         round_hydraulic_rejected,
                         new_branch_rel_p95,
                         terminal_path_rel_p95,
+                        sum(values(branch_caps)),
+                        sum(max(branch_caps[name] - total_added[name], 0) for name in branch_names),
                     ), ","))
                 end
             end
@@ -1245,6 +1662,9 @@ function grow_trees_mcp!(trees::Dict{String, GrowthTree}, domain;
         unclaimed_targets=current_unclaimed,
         coverage_points=n_points,
         branch_cap_total=total_branch_cap,
+        initial_branch_cap_total=branch_cap_budget,
+        branch_cap_unfilled=sum(max(branch_caps[name] - total_added[name], 0) for name in branch_names),
+        adaptive_branch_caps=adaptive_branch_caps,
     )
     for (ti, name) in enumerate(branch_names)
         idxs = territories[name]
@@ -1259,10 +1679,15 @@ function grow_trees_mcp!(trees::Dict{String, GrowthTree}, domain;
             added=total_added[name],
             initial_territory_points=initial_owner_counts[ti],
             initial_territory_fraction=n_points > 0 ? initial_owner_counts[ti] / n_points : NaN,
+            territory_bootstrap_points=territory_bootstrap_added[ti],
+            territory_floor_points=territory_floor_counts[ti],
+            territory_floor_maintenance_points=territory_floor_maintenance_added[ti],
             territory_points=territory_points,
             territory_fraction=n_points > 0 ? territory_points / n_points : NaN,
+            initial_branch_cap=get(initial_branch_caps, name, 0),
             branch_cap=branch_caps[name],
             branch_cap_fraction=total_branch_cap > 0 ? branch_caps[name] / total_branch_cap : NaN,
+            unused_branch_cap=max(branch_caps[name] - total_added[name], 0),
             tree_weight_raw=raw_weights[ti],
             tree_weight_normalized=norm_weights[ti],
             territory_weight_normalized=territory_w_arr[ti],
@@ -1353,6 +1778,8 @@ function run_growth(config::OrganConfig; output_dir::String="output")
         max_path_nodes=config.max_path_nodes,
         frontier_batch=config.frontier_batch,
         gamma=config.murray_gamma,
+        proximal_gamma=config.proximal_murray_gamma,
+        murray_transition_diameter_cm=config.murray_transition_diameter_cm,
         smooth_passes=config.smooth_passes,
         spline_density=config.spline_density,
         max_segment_length_cm=config.max_segment_length_cm,
@@ -1366,6 +1793,8 @@ function run_growth(config::OrganConfig; output_dir::String="output")
         max_new_branch_resistance_rel=config.max_new_branch_resistance_rel,
         max_terminal_path_resistance_rel=config.max_terminal_path_resistance_rel,
         blood_viscosity_poise=config.blood_viscosity_poise,
+        min_initial_territory_fraction=config.min_initial_territory_fraction,
+        max_initial_territory_points_per_tree=config.max_initial_territory_points_per_tree,
         turn_penalty=config.turn_penalty,
         graph_jitter_cm=0.0)  # jitter already applied above from config
 

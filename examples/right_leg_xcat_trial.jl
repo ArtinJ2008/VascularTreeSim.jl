@@ -1,9 +1,9 @@
 """
     right_leg_xcat_trial.jl
 
-Build a right-leg muscle mask from a both-legs XCAT color-code RAW volume,
-seed growth from XCAT right-leg NRB artery centerlines, overlay the main XCAT
-right-leg NRB veins after growth, and write the rich femoral viewer.
+Legacy raw-label right-leg trial helpers. The executable trial entry point is
+disabled; production right-leg runs should use `right_leg_xcat_50um_gpu.jl`,
+which builds tissue domains and vessel paths from XCAT NRB surfaces.
 
 Usage:
     julia --project=. examples/right_leg_xcat_trial.jl [max_branches] [terminal_um] [output_dir] [input_dir] [geometry_dir] [block_size] [main_veins]
@@ -1237,6 +1237,7 @@ function write_right_leg_trial_summary(path::AbstractString, raw_path, organ_ids
 end
 
 function main_right_leg_xcat_trial()
+    error("The legacy raw-label right-leg trial is disabled. Use examples/right_leg_xcat_50um_gpu.jl, which now builds right-leg tissue domains and vessels from the XCAT NRB.")
     Random.seed!(42)
     max_branches = length(ARGS) >= 1 ? parse(Int, ARGS[1]) : 1000
     terminal_um = length(ARGS) >= 2 ? parse(Float64, ARGS[2]) : 100.0
@@ -1379,5 +1380,5 @@ function main_right_leg_xcat_trial()
 end
 
 if abspath(PROGRAM_FILE) == @__FILE__
-    main_right_leg_xcat_trial()
+    legacy_raw_entrypoint_error("examples/right_leg_xcat_trial.jl")
 end
