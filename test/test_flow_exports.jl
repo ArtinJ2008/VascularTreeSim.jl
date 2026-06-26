@@ -155,7 +155,7 @@ end
     n_vertices = length(skipped.vertices)
     subdivide_terminals!(skipped;
         target_diameter_cm=0.01,
-        subdivide_xcat_terminals=false)
+        skip_xcat=true)
     @test length(skipped.vertices) == n_vertices
     @test length(VascularTreeSim._branch_terminals(skipped)) == 1
 

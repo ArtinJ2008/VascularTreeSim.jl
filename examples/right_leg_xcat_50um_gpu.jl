@@ -185,6 +185,116 @@ function branch_caps_from_weights(names::Vector{String}, weights::Vector{Float64
     return caps
 end
 
+function subdivision_leaf_factor(growth_terminal_cm::Float64, final_terminal_cm::Float64;
+                                 gamma::Float64=3.0)
+    growth_terminal_cm > 0.0 || error("growth terminal diameter must be positive")
+    final_terminal_cm > 0.0 || error("final terminal diameter must be positive")
+    final_terminal_cm < growth_terminal_cm || return 1
+    levels = max(0, ceil(Int, gamma * log2(growth_terminal_cm / final_terminal_cm)) - 1)
+    return 2 ^ levels
+end
+
+function requested_target_count_from_arg(target_arg::AbstractString)
+    text = lowercase(strip(String(target_arg)))
+    text == "auto" && return nothing
+    count = parse(Int, text)
+    count > 0 || error("Requested target count must be positive, got `$target_arg`")
+    return count
+end
+
+function resolve_growth_target_branches(target_arg::AbstractString,
+                                        target_branch_count_mode::AbstractString,
+                                        subdivision_factor::Int,
+                                        root_diameters::Vector{Float64},
+                                        growth_terminal_cm::Float64,
+                                        distal_murray_gamma::Float64,
+                                        proximal_murray_gamma::Float64,
+                                        murray_transition_cm::Float64)
+    requested_count = requested_target_count_from_arg(target_arg)
+    if requested_count === nothing
+        capacities = [
+            murray_terminal_capacity(d, growth_terminal_cm;
+                gamma=distal_murray_gamma,
+                proximal_gamma=proximal_murray_gamma,
+                transition_diameter_cm=murray_transition_cm)
+            for d in root_diameters
+        ]
+        return max(1, sum(floor(Int, cap) for cap in capacities)), requested_count
+    elseif target_branch_count_mode == "explicit"
+        return requested_count, requested_count
+    elseif target_branch_count_mode == "final_subdivision"
+        return max(1, ceil(Int, requested_count / subdivision_factor)), requested_count
+    else
+        error("Unknown target branch count mode `$target_branch_count_mode`")
+    end
+end
+
+function root_capacity_branch_caps(names::Vector{String},
+                                   root_diameters::Vector{Float64},
+                                   growth_terminal_cm::Float64,
+                                   target_branches::Int,
+                                   distal_murray_gamma::Float64,
+                                   proximal_murray_gamma::Float64,
+                                   murray_transition_cm::Float64)
+    caps = Dict{String, Int}()
+    for (name, d) in zip(names, root_diameters)
+        if d <= 0.0
+            caps[name] = target_branches
+        else
+            cap = floor(Int, murray_terminal_capacity(d, growth_terminal_cm;
+                gamma=distal_murray_gamma,
+                proximal_gamma=proximal_murray_gamma,
+                transition_diameter_cm=murray_transition_cm))
+            caps[name] = max(cap, 0)
+        end
+    end
+    return caps
+end
+
+function constrain_branch_caps_to_root_capacity(branch_caps::Dict{String, Int},
+                                                names::Vector{String},
+                                                capacity_caps::Dict{String, Int},
+                                                weights::Dict{String, Float64},
+                                                target_branches::Int)
+    total_capacity = sum(get(capacity_caps, name, 0) for name in names)
+    if target_branches > total_capacity
+        error("Requested $(target_branches) explicit growth branches, but the selected roots can support only " *
+              "$(total_capacity) at the current growth terminal diameter and Murray/root-capacity law. " *
+              "This would leave coverage unfinished and produce high p95. Reduce the requested explicit target, " *
+              "select/add more XCAT artery seeds, increase the routed growth terminal diameter, or use the original " *
+              "predictor-style gamma=3 capacity for a baseline run.")
+    end
+
+    constrained = Dict(name => min(get(branch_caps, name, 0), get(capacity_caps, name, 0)) for name in names)
+    remaining = target_branches - sum(values(constrained))
+    while remaining > 0
+        available = [name for name in names if constrained[name] < capacity_caps[name]]
+        isempty(available) && error("Internal branch-cap allocation error: no root capacity remains")
+        total_weight = sum(max(get(weights, name, 0.0), 1e-12) for name in available)
+        additions = Dict(name => 0 for name in available)
+        for name in available
+            spare = capacity_caps[name] - constrained[name]
+            share = remaining * max(get(weights, name, 0.0), 1e-12) / total_weight
+            additions[name] = min(spare, floor(Int, share))
+        end
+        added = sum(values(additions))
+        if added == 0
+            order = sort(available; by=name -> (-max(get(weights, name, 0.0), 1e-12), name))
+            for name in order
+                constrained[name] += 1
+                remaining -= 1
+                remaining == 0 && break
+            end
+        else
+            for name in available
+                constrained[name] += additions[name]
+            end
+            remaining -= added
+        end
+    end
+    return constrained
+end
+
 function make_right_leg_growth_trees(paths::Vector{XCATSeedPath}; terminal_diameter_cm::Float64)
     trees = Dict{String, GrowthTree}()
     names = String[]
@@ -774,6 +884,12 @@ function main_right_leg_xcat_50um_gpu()
         extreme_export_defaults ? "false" : "true"))
     export_full_arterial_csv = parse_bool_arg(get(ENV, "VTS_EXPORT_FULL_ARTERIAL_CSV",
         extreme_export_defaults ? "false" : "true"))
+    emit_hemodynamic_csv = parse_bool_arg(get(ENV, "VTS_WRITE_HEMODYNAMIC_CSV", "true"))
+    emit_terminal_bed_csv = parse_bool_arg(get(ENV, "VTS_WRITE_TERMINAL_BED_CSV", "true"))
+    emit_topology_audit_csv = parse_bool_arg(get(ENV, "VTS_WRITE_TOPOLOGY_AUDIT_CSV", "true"))
+    emit_terminal_path_audit_csv = parse_bool_arg(get(ENV, "VTS_WRITE_TERMINAL_PATH_AUDIT_CSV", "true"))
+    emit_root_territory_audit_csv = parse_bool_arg(get(ENV, "VTS_WRITE_ROOT_TERRITORY_AUDIT_CSV", "true"))
+    emit_diameter_order_audit_csv = parse_bool_arg(get(ENV, "VTS_WRITE_DIAMETER_ORDER_AUDIT_CSV", "true"))
     topology_audit_min_diameter_um = parse(Float64, get(ENV, "VTS_TOPOLOGY_AUDIT_MIN_DIAMETER_UM",
         extreme_export_defaults ? string(flow_explicit_min_diameter_um) : "0.0"))
     terminal_path_audit_max_rows_raw = parse(Int, get(ENV, "VTS_TERMINAL_PATH_AUDIT_MAX_ROWS",
@@ -885,15 +1001,37 @@ function main_right_leg_xcat_50um_gpu()
     root_diameters = [trees[name].root_diameter_cm for name in growth_tree_names]
     capacity_weights = Dict(name => artery_weight(path) for (name, path) in zip(growth_tree_names, growth_artery_paths))
     territory_distance_weights = Dict(name => proximal_root_diameter_cm(path) for (name, path) in zip(growth_tree_names, growth_artery_paths))
-    # Subdivision is a symmetric binary bifurcation (gamma=3): each growth terminal
-    # yields 2^(ceil(3*log2(growth/final)) - 1) leaves, NOT the continuous (growth/final)^3.
-    # Use the actual binary leaf count so target_branches back-computes to the requested total.
-    subdivision_factor = final_terminal_cm < growth_terminal_cm ? 2 ^ max(0, ceil(Int, 3 * log2(growth_terminal_cm / final_terminal_cm)) - 1) : 1
-    target_branches = lowercase(target_arg) == "auto" ?
-        ceil(Int, (maximum(root_diameters) / growth_terminal_cm)^3) :
-        max(1, ceil(Int, parse(Int, target_arg) / subdivision_factor))
-    branch_caps = branch_caps_from_weights(growth_tree_names,
+    # Subdivision is a symmetric binary bifurcation. `explicit` target mode means
+    # the requested count is the routed CCO branch budget before subdivision.
+    # `final_subdivision` means the requested count is the post-subdivision leaf
+    # count and must be back-computed by the actual binary leaf multiplier.
+    subdivision_factor = subdivision_leaf_factor(growth_terminal_cm, final_terminal_cm;
+        gamma=distal_murray_gamma)
+    target_branches, requested_target_count = resolve_growth_target_branches(
+        target_arg,
+        target_branch_count_mode,
+        subdivision_factor,
+        root_diameters,
+        growth_terminal_cm,
+        distal_murray_gamma,
+        proximal_murray_gamma,
+        murray_transition_cm)
+    unconstrained_branch_caps = branch_caps_from_weights(growth_tree_names,
         [capacity_weights[name] for name in growth_tree_names], target_branches)
+    root_capacity_caps = root_capacity_branch_caps(
+        growth_tree_names,
+        root_diameters,
+        growth_terminal_cm,
+        target_branches,
+        distal_murray_gamma,
+        proximal_murray_gamma,
+        murray_transition_cm)
+    branch_caps = constrain_branch_caps_to_root_capacity(
+        unconstrained_branch_caps,
+        growth_tree_names,
+        root_capacity_caps,
+        capacity_weights,
+        target_branches)
     coverage_count = max(target_branches, ceil(Int, target_branches * coverage_multiplier))
     # Projected post-subdivision terminal count = grown branches x per-terminal subdivision
     # leaves. The `auto` branch sizes target_branches to the GROWTH stage only, so without
@@ -941,6 +1079,8 @@ function main_right_leg_xcat_50um_gpu()
     println("Growth seeds: " * join([path.surface for path in growth_artery_paths], ", "))
     println("Seed proximal capacity diameters: " * join(["$(round(trees[name].root_diameter_cm * 10; digits=3)) mm" for name in growth_tree_names], ", "))
     println("Target added routed-growth branches: $(target_branches)")
+    println("Total root capacity at routed-growth diameter: $(sum(root_capacity_caps[name] for name in growth_tree_names))")
+    println("Per-seed root capacities: " * join(["$(name)=$(root_capacity_caps[name])" for name in growth_tree_names], ", "))
     println("Per-seed branch caps: " * join(["$(name)=$(branch_caps[name])" for name in growth_tree_names], ", "))
     println("Coverage points: $(coverage_count)")
     println("Target demand mode: $(target_demand_mode)")
@@ -969,6 +1109,12 @@ function main_right_leg_xcat_50um_gpu()
     println("Maximum unclaimed target fraction: $(max_unclaimed_target_fraction)")
     println("Export full combined geometry CSV: $(export_full_geometry_csv)")
     println("Export full arterial CSV: $(export_full_arterial_csv)")
+    println("Write hemodynamic CSV: $(emit_hemodynamic_csv)")
+    println("Write terminal bed CSV: $(emit_terminal_bed_csv)")
+    println("Write topology audit CSV: $(emit_topology_audit_csv)")
+    println("Write terminal path audit CSV: $(emit_terminal_path_audit_csv)")
+    println("Write root territory audit CSV: $(emit_root_territory_audit_csv)")
+    println("Write diameter/order audit CSV: $(emit_diameter_order_audit_csv)")
     println("Topology audit minimum grown-segment diameter: $(topology_audit_min_diameter_um) um")
     println("Terminal-path audit max rows: " *
         (terminal_path_audit_max_rows === nothing ? "all" : string(terminal_path_audit_max_rows)))
@@ -1132,12 +1278,47 @@ function main_right_leg_xcat_50um_gpu()
     else
         println("[export] skipped full arterial CSV; hemodynamic export remains enabled. Set VTS_EXPORT_FULL_ARTERIAL_CSV=true to write $(arterial_csv_path)")
     end
-    write_hemodynamic_tree_csv(hemodynamic_csv_path, RIGHT_LEG_50UM_TREE_NAME, tree;
-        min_explicit_diameter_um=flow_explicit_min_diameter_um, viscosity_poise=blood_viscosity_poise)
-    write_flow_topology_audit_csv(topology_audit_csv, RIGHT_LEG_50UM_TREE_NAME, tree; viscosity_poise=blood_viscosity_poise)
-    write_terminal_path_audit_csv(terminal_path_audit_csv, RIGHT_LEG_50UM_TREE_NAME, tree; viscosity_poise=blood_viscosity_poise)
-    write_root_territory_audit_csv(root_territory_audit_csv, RIGHT_LEG_50UM_TREE_NAME, tree; viscosity_poise=blood_viscosity_poise)
-    write_diameter_order_audit_csv(diameter_order_audit_csv, RIGHT_LEG_50UM_TREE_NAME, tree; viscosity_poise=blood_viscosity_poise)
+    if emit_hemodynamic_csv
+        write_hemodynamic_tree_csv(hemodynamic_csv_path, RIGHT_LEG_50UM_TREE_NAME, tree;
+            min_explicit_diameter_um=flow_explicit_min_diameter_um, viscosity_poise=blood_viscosity_poise)
+    else
+        println("[export] skipped hemodynamic CSV; set VTS_WRITE_HEMODYNAMIC_CSV=true to write $(hemodynamic_csv_path)")
+    end
+    if emit_terminal_bed_csv
+        write_terminal_bed_audit_csv(terminal_bed_csv, RIGHT_LEG_50UM_TREE_NAME, tree;
+            bed_terminal_diameter_um=terminal_bed_diameter_um,
+            min_explicit_diameter_um=flow_explicit_min_diameter_um,
+            terminal_bed_length_cm=terminal_bed_length_cm,
+            gamma=distal_murray_gamma,
+            proximal_gamma=proximal_murray_gamma,
+            transition_diameter_cm=murray_transition_cm,
+            viscosity_poise=blood_viscosity_poise)
+    else
+        println("[export] skipped terminal bed CSV; set VTS_WRITE_TERMINAL_BED_CSV=true to write $(terminal_bed_csv)")
+    end
+    if emit_topology_audit_csv
+        write_flow_topology_audit_csv(topology_audit_csv, RIGHT_LEG_50UM_TREE_NAME, tree; viscosity_poise=blood_viscosity_poise)
+    else
+        println("[export] skipped topology audit CSV; set VTS_WRITE_TOPOLOGY_AUDIT_CSV=true to write $(topology_audit_csv)")
+    end
+    if emit_terminal_path_audit_csv
+        write_terminal_path_audit_csv(terminal_path_audit_csv, RIGHT_LEG_50UM_TREE_NAME, tree;
+            max_rows=terminal_path_audit_max_rows,
+            include_path_segments=terminal_path_audit_include_segments,
+            viscosity_poise=blood_viscosity_poise)
+    else
+        println("[export] skipped terminal path audit CSV; set VTS_WRITE_TERMINAL_PATH_AUDIT_CSV=true to write $(terminal_path_audit_csv)")
+    end
+    if emit_root_territory_audit_csv
+        write_root_territory_audit_csv(root_territory_audit_csv, RIGHT_LEG_50UM_TREE_NAME, tree)
+    else
+        println("[export] skipped root territory audit CSV; set VTS_WRITE_ROOT_TERRITORY_AUDIT_CSV=true to write $(root_territory_audit_csv)")
+    end
+    if emit_diameter_order_audit_csv
+        write_diameter_order_audit_csv(diameter_order_audit_csv, RIGHT_LEG_50UM_TREE_NAME, tree; viscosity_poise=blood_viscosity_poise)
+    else
+        println("[export] skipped diameter/order audit CSV; set VTS_WRITE_DIAMETER_ORDER_AUDIT_CSV=true to write $(diameter_order_audit_csv)")
+    end
     write_xcat_seed_csv(xcat_fixed_csv, tree)
     write_xcat_paths_csv(nrb_artery_csv, fixed_artery_paths)
     write_xcat_paths_csv(nrb_vein_csv, vein_paths)
@@ -1254,12 +1435,12 @@ function main_right_leg_xcat_50um_gpu()
     println("  $(seed_territory_audit_csv)")
     export_full_geometry_csv && println("  $(csv_path)")
     export_full_arterial_csv && println("  $(arterial_csv_path)")
-    println("  $(hemodynamic_csv_path)")
-    println("  $(terminal_bed_csv)")
-    println("  $(topology_audit_csv)")
-    println("  $(terminal_path_audit_csv)")
-    println("  $(root_territory_audit_csv)")
-    println("  $(diameter_order_audit_csv)")
+    emit_hemodynamic_csv && println("  $(hemodynamic_csv_path)")
+    emit_terminal_bed_csv && println("  $(terminal_bed_csv)")
+    emit_topology_audit_csv && println("  $(topology_audit_csv)")
+    emit_terminal_path_audit_csv && println("  $(terminal_path_audit_csv)")
+    emit_root_territory_audit_csv && println("  $(root_territory_audit_csv)")
+    emit_diameter_order_audit_csv && println("  $(diameter_order_audit_csv)")
     println("  $(xcat_fixed_csv)")
     println("  $(nrb_artery_csv)")
     println("  $(nrb_vein_csv)")

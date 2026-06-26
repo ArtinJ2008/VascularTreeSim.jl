@@ -1,26 +1,27 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-WORK_ROOT="/media/molloi-lab/2TB4/Artin/right_leg_corrected_50um_full_20260615_1453"
-REPO="${WORK_ROOT}/repo/VascularTreeSim.jl"
-INPUT="${WORK_ROOT}/input/both_legs_xcat_input"
+WORK_ROOT="${VTS_WORK_ROOT:-/media/molloi-lab/2TB4/Artin/right_leg_corrected_50um_full_20260615_1453}"
+REPO="${VTS_REPO:-${WORK_ROOT}/repo/VascularTreeSim.jl}"
+INPUT="${VTS_INPUT_ROOT:-${WORK_ROOT}/input/both_legs_xcat_input}"
 STAMP="$(date +%Y%m%d_%H%M%S)"
 
 TERMINAL_UM="${VTS_TERMINAL_UM:-8.0}"
 EXPLICIT_TERMINAL_UM="${VTS_EXPLICIT_TERMINAL_UM:-200.0}"
-TARGET_200UM_BRANCHES="${VTS_TARGET_BRANCHES:-20000}"
-OUT="${WORK_ROOT}/output/right_leg_original_style_${EXPLICIT_TERMINAL_UM/./p}um_to_${TERMINAL_UM/./p}um_${TARGET_200UM_BRANCHES}cco_${STAMP}"
-LOG_DIR="${WORK_ROOT}/logs"
-LOG="${LOG_DIR}/right_leg_original_style_${EXPLICIT_TERMINAL_UM/./p}um_to_${TERMINAL_UM/./p}um_${TARGET_200UM_BRANCHES}cco_${STAMP}.log"
+TARGET_200UM_BRANCHES="${VTS_TARGET_BRANCHES:-auto}"
+RUN_LABEL="${VTS_RUN_LABEL:-RightLeg8um_${STAMP}}"
+OUT="${VTS_OUTPUT_DIR:-${WORK_ROOT}/output/${RUN_LABEL}}"
+LOG_DIR="${VTS_LOG_DIR:-${WORK_ROOT}/logs}"
+LOG="${VTS_LOG_PATH:-${LOG_DIR}/${RUN_LABEL}.log}"
 
 mkdir -p "${OUT}" "${LOG_DIR}"
 cd "${REPO}"
 
-export JULIA_DEPOT_PATH="/media/molloi-lab/2TB4/Artin/julia_depot"
+export JULIA_DEPOT_PATH="${JULIA_DEPOT_PATH:-/media/molloi-lab/2TB4/Artin/julia_depot}"
 export JULIA_NUM_THREADS="${JULIA_NUM_THREADS:-16}"
 export CUDA_DEVICE_ORDER="PCI_BUS_ID"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
-export VTS_CHECKPOINT_DIR="${OUT}/checkpoints"
+export VTS_CHECKPOINT_DIR="${VTS_CHECKPOINT_DIR:-${OUT}/checkpoints}"
 export VTS_CHECKPOINT_INTERVAL_SECONDS="${VTS_CHECKPOINT_INTERVAL_SECONDS:-1800}"
 export VTS_CHECKPOINT_KEEP="${VTS_CHECKPOINT_KEEP:-3}"
 
@@ -48,7 +49,12 @@ export VTS_TARGET_DEMAND_WEIGHTS="${VTS_TARGET_DEMAND_WEIGHTS:-muscle=1.0,skin=0
 export VTS_MAX_COVERAGE_POINTS="${VTS_MAX_COVERAGE_POINTS:-5000000}"
 
 export VTS_DISTAL_MURRAY_GAMMA="${VTS_DISTAL_MURRAY_GAMMA:-3.0}"
-export VTS_PROXIMAL_MURRAY_GAMMA="${VTS_PROXIMAL_MURRAY_GAMMA:-2.0}"
+# Match the original predictor baseline for this run: grow the routed CCO tree
+# with the same Murray exponent through the 200um stage, then subdivide to 8um.
+# Setting this to 2.0 is allowed, but it dramatically lowers the number of
+# supportable 200um terminals from a femoral root and should be a labeled
+# physiology experiment rather than the baseline.
+export VTS_PROXIMAL_MURRAY_GAMMA="${VTS_PROXIMAL_MURRAY_GAMMA:-3.0}"
 export VTS_MURRAY_TRANSITION_UM="${VTS_MURRAY_TRANSITION_UM:-200.0}"
 export VTS_SUBDIVISION_MAX_LD_RATIO="${VTS_SUBDIVISION_MAX_LD_RATIO:-25.0}"
 export VTS_SUBDIVISION_CLIP_BELOW_UM="${VTS_SUBDIVISION_CLIP_BELOW_UM:-50.0}"
@@ -63,6 +69,12 @@ export VTS_FLOW_EXPLICIT_MIN_DIAMETER_UM="${VTS_FLOW_EXPLICIT_MIN_DIAMETER_UM:-8
 export VTS_TOPOLOGY_AUDIT_MIN_DIAMETER_UM="${VTS_TOPOLOGY_AUDIT_MIN_DIAMETER_UM:-0.0}"
 export VTS_TERMINAL_PATH_AUDIT_MAX_ROWS="${VTS_TERMINAL_PATH_AUDIT_MAX_ROWS:-500000}"
 export VTS_TERMINAL_PATH_AUDIT_INCLUDE_SEGMENTS="${VTS_TERMINAL_PATH_AUDIT_INCLUDE_SEGMENTS:-false}"
+export VTS_WRITE_HEMODYNAMIC_CSV="${VTS_WRITE_HEMODYNAMIC_CSV:-false}"
+export VTS_WRITE_TERMINAL_BED_CSV="${VTS_WRITE_TERMINAL_BED_CSV:-false}"
+export VTS_WRITE_TOPOLOGY_AUDIT_CSV="${VTS_WRITE_TOPOLOGY_AUDIT_CSV:-false}"
+export VTS_WRITE_TERMINAL_PATH_AUDIT_CSV="${VTS_WRITE_TERMINAL_PATH_AUDIT_CSV:-false}"
+export VTS_WRITE_ROOT_TERRITORY_AUDIT_CSV="${VTS_WRITE_ROOT_TERRITORY_AUDIT_CSV:-false}"
+export VTS_WRITE_DIAMETER_ORDER_AUDIT_CSV="${VTS_WRITE_DIAMETER_ORDER_AUDIT_CSV:-false}"
 
 # Keep this reference run close to the original predictor. Extra flow-aware
 # ranking can be enabled later after the baseline audits are understood.
@@ -120,6 +132,12 @@ FIXED_VEIN_MIN_LENGTH_CM="${VTS_FIXED_VEIN_MIN_LENGTH_CM:-8.0}"
     echo "subdivision_clip_below_um=${VTS_SUBDIVISION_CLIP_BELOW_UM}"
     echo "export_full_arterial_csv=${VTS_EXPORT_FULL_ARTERIAL_CSV}"
     echo "flow_explicit_min_diameter_um=${VTS_FLOW_EXPLICIT_MIN_DIAMETER_UM}"
+    echo "write_hemodynamic_csv=${VTS_WRITE_HEMODYNAMIC_CSV}"
+    echo "write_terminal_bed_csv=${VTS_WRITE_TERMINAL_BED_CSV}"
+    echo "write_topology_audit_csv=${VTS_WRITE_TOPOLOGY_AUDIT_CSV}"
+    echo "write_terminal_path_audit_csv=${VTS_WRITE_TERMINAL_PATH_AUDIT_CSV}"
+    echo "write_root_territory_audit_csv=${VTS_WRITE_ROOT_TERRITORY_AUDIT_CSV}"
+    echo "write_diameter_order_audit_csv=${VTS_WRITE_DIAMETER_ORDER_AUDIT_CSV}"
     echo "graph_block_size=${GRAPH_BLOCK_SIZE}"
     echo "frontier_batch=${FRONTIER_BATCH}"
     echo "coverage_multiplier=${COVERAGE_MULTIPLIER}"

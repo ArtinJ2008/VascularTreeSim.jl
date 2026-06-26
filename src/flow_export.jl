@@ -264,7 +264,7 @@ function write_terminal_path_audit_csv(path::AbstractString, branch::String, tre
                                        viscosity_poise::Float64=DEFAULT_BLOOD_VISCOSITY_POISE)
     if max_rows !== nothing && max_rows <= 0
         open(path, "w") do io
-            println(io, "branch,terminal_vertex,root_vertex,incoming_segment,role,label,generation,branchpoint_generation,strahler_order,path_length_mm,path_resistance_rel,min_path_diameter_um,max_path_diameter_um,path_segment_count,degree2_segment_count,max_degree2_chain_segments,path_segments")
+            println(io, "branch,terminal_vertex,root_vertex,incoming_segment,role,label,generation,branchpoint_generation,strahler_order,path_length_mm,path_resistance_abs,min_path_diameter_um,max_path_diameter_um,path_segment_count,degree2_segment_count,max_degree2_chain_segments,path_segments")
         end
         return path
     end
@@ -282,6 +282,8 @@ function write_terminal_path_audit_csv(path::AbstractString, branch::String, tre
     end
     sample_stride = max_rows === nothing ? 1 :
         max(1, ceil(Int, total_terminals / max(max_rows, 1)))
+    terminal_index = 0
+    written = 0
 
     open(path, "w") do io
         println(io, "branch,terminal_vertex,root_vertex,incoming_segment,role,label,generation,branchpoint_generation,strahler_order,path_length_mm,path_resistance_abs,min_path_diameter_um,max_path_diameter_um,path_segment_count,degree2_segment_count,max_degree2_chain_segments,path_segments")
@@ -520,6 +522,8 @@ function write_hemodynamic_tree_csv(path::AbstractString, branch::String, tree::
             min_source_diameter_um=1.0e4 * max_d,
             max_source_diameter_um=1.0e4 * max_d,
             resistance_abs=0.0,
+            delta_z_cm=0.0,
+            gravity_head_mmHg=0.0,
             generation=0,
             strahler_order=isempty(child_ids) ? 1 : maximum(metrics.strahler_order[s] for s in child_ids),
             subtree_terminals=total_terms,
@@ -602,6 +606,8 @@ function write_hemodynamic_tree_csv(path::AbstractString, branch::String, tree::
             min_source_diameter_um=1.0e4 * min_d,
             max_source_diameter_um=1.0e4 * max_d,
             resistance_abs=resistance,
+            delta_z_cm=delta_z_cm,
+            gravity_head_mmHg=gravity_head_mmHg,
             generation=flow_generation,
             strahler_order=isempty(orders) ? 1 : maximum(orders),
             subtree_terminals=tree.subtree_terminal_count[tree.segment_end[first_seg]],
@@ -628,7 +634,7 @@ function write_hemodynamic_tree_csv(path::AbstractString, branch::String, tree::
     end
 
     open(path, "w") do io
-        println(io, "branch,flow_segment_id,parent_flow_segment_id,source_segment_ids,start_vertex,end_vertex,x1_cm,y1_cm,z1_cm,x2_cm,y2_cm,z2_cm,path_length_mm,chord_length_mm,tortuosity,equiv_diameter_um,min_source_diameter_um,max_source_diameter_um,resistance_abs,generation,strahler_order,subtree_terminals,exported_child_count,pruned_child_count,terminal_bed,xcat_segment_count,grown_segment_count,labels")
+        println(io, "branch,flow_segment_id,parent_flow_segment_id,source_segment_ids,start_vertex,end_vertex,x1_cm,y1_cm,z1_cm,x2_cm,y2_cm,z2_cm,path_length_mm,chord_length_mm,tortuosity,equiv_diameter_um,min_source_diameter_um,max_source_diameter_um,resistance_abs,delta_z_cm,gravity_head_mmHg,generation,strahler_order,subtree_terminals,exported_child_count,pruned_child_count,terminal_bed,xcat_segment_count,grown_segment_count,labels")
         for r in rows
             println(io, join((
                 branch,
@@ -646,6 +652,8 @@ function write_hemodynamic_tree_csv(path::AbstractString, branch::String, tree::
                 r.min_source_diameter_um,
                 r.max_source_diameter_um,
                 r.resistance_abs,
+                r.delta_z_cm,
+                r.gravity_head_mmHg,
                 r.generation,
                 r.strahler_order,
                 r.subtree_terminals,

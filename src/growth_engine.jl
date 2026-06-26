@@ -1277,8 +1277,8 @@ function grow_trees_mcp!(trees::Dict{String, GrowthTree}, domain;
             remaining = branch_caps[name] - total_added[name]
             round_batches[ti] = min(tree_to_batch[name], remaining)
         end
-        round_cap_total = sum(branch_caps[branch_names[ti]] for ti in 1:n_trees if round_batches[ti] > 0)
         process_order = [ti for ti in 1:n_trees if round_batches[ti] > 0]
+        round_cap_total = sum((branch_caps[branch_names[ti]] for ti in process_order); init=0)
         sort!(process_order; by=ti -> begin
             cap = branch_caps[branch_names[ti]]
             expected = round_cap_total > 0 ? n_points * cap / round_cap_total : 0.0
