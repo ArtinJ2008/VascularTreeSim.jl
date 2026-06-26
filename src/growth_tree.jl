@@ -608,7 +608,7 @@ function subdivide_terminals!(tree::GrowthTree;
         ld_ratio::Float64=12.0,
         max_ld_ratio::Float64=25.0,
         clip_below_diameter_cm::Float64=0.0,
-        subdivide_xcat_terminals::Bool=true,
+        skip_xcat::Bool=false,
         domain::Union{Nothing, VoxelShellDomain}=nothing)
 
     target_diameter_cm >= tree.terminal_diameter_cm && return nothing
@@ -631,6 +631,9 @@ function subdivide_terminals!(tree::GrowthTree;
     for tip_v in terminals
         seg = tree.incoming_segment[tip_v]
         seg == 0 && continue
+        # Skip real XCAT artery tips (e.g. femoral distal end): subdividing a mm-scale
+        # seed terminal would sprout a fake symmetric capillary fan off a major artery.
+        skip_xcat && tree.is_xcat[seg] && continue
         d_cm = tree.segment_diameter_cm[seg]
         d_cm <= target_diameter_cm && continue
 
@@ -906,13 +909,12 @@ function _recompute_all_murray!(tree::GrowthTree;
             #     → 6× root Poiseuille R, flow chokes at root
             #   • leaving a 0.6 mm distal XCAT bottleneck intact
             #     → flow chokes at the XCAT→grown junction
-            # For grown/subdivided segments (is_xcat=false), murray_d is the
-            # authoritative value by design, so max() just recovers that.
+            # For grown/subdivided segments (is_xcat=false), murray_d (from the
+            # recomputed, post-clipping terminal count) is authoritative and is used
+            # directly: max() with the stale top-down creation diameter would keep an
+            # OVERSIZED value wherever domain clipping reduced the surviving terminals.
             n = tree.subtree_terminal_count[v]
-            murray_d = murray_diameter_from_terminals(n, target_diameter_cm;
-                gamma=gamma,
-                proximal_gamma=proximal_gamma,
-                transition_diameter_cm=transition_diameter_cm)
+            murray_d = target_diameter_cm * n^(1.0 / gamma)
             tree.segment_diameter_cm[seg] = tree.is_xcat[seg] ?
                 max(tree.segment_diameter_cm[seg], murray_d) : murray_d
         end

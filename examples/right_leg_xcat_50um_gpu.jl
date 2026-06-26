@@ -885,33 +885,27 @@ function main_right_leg_xcat_50um_gpu()
     root_diameters = [trees[name].root_diameter_cm for name in growth_tree_names]
     capacity_weights = Dict(name => artery_weight(path) for (name, path) in zip(growth_tree_names, growth_artery_paths))
     territory_distance_weights = Dict(name => proximal_root_diameter_cm(path) for (name, path) in zip(growth_tree_names, growth_artery_paths))
-    subdivision_factor = final_terminal_cm < growth_terminal_cm && allow_post_growth_subdivision ?
-        max(1, ceil(Int, murray_terminal_capacity(growth_terminal_cm, final_terminal_cm;
-            gamma=distal_murray_gamma,
-            proximal_gamma=proximal_murray_gamma,
-            transition_diameter_cm=murray_transition_cm))) :
-        1
-    requested_target_count = lowercase(target_arg) == "auto" ? nothing : parse(Int, target_arg)
-    target_branches = if requested_target_count === nothing
-        ceil(Int, murray_terminal_capacity(maximum(root_diameters), growth_terminal_cm;
-            gamma=distal_murray_gamma,
-            proximal_gamma=proximal_murray_gamma,
-            transition_diameter_cm=murray_transition_cm))
-    elseif target_branch_count_mode == "final_subdivision"
-        terminal_bed_mode && error("VTS_TARGET_BRANCH_COUNT_MODE=final_subdivision is not compatible with VTS_TERMINAL_BED_MODE=true. Use explicit target count for collapsed terminal-bed runs.")
-        max(1, ceil(Int, requested_target_count / subdivision_factor))
-    else
-        max(1, requested_target_count)
-    end
+    # Subdivision is a symmetric binary bifurcation (gamma=3): each growth terminal
+    # yields 2^(ceil(3*log2(growth/final)) - 1) leaves, NOT the continuous (growth/final)^3.
+    # Use the actual binary leaf count so target_branches back-computes to the requested total.
+    subdivision_factor = final_terminal_cm < growth_terminal_cm ? 2 ^ max(0, ceil(Int, 3 * log2(growth_terminal_cm / final_terminal_cm)) - 1) : 1
+    target_branches = lowercase(target_arg) == "auto" ?
+        ceil(Int, (maximum(root_diameters) / growth_terminal_cm)^3) :
+        max(1, ceil(Int, parse(Int, target_arg) / subdivision_factor))
     branch_caps = branch_caps_from_weights(growth_tree_names,
         [capacity_weights[name] for name in growth_tree_names], target_branches)
     coverage_count = max(target_branches, ceil(Int, target_branches * coverage_multiplier))
+    # Projected post-subdivision terminal count = grown branches x per-terminal subdivision
+    # leaves. The `auto` branch sizes target_branches to the GROWTH stage only, so without
+    # this guard the subdivision can materialize hundreds of millions of segments while
+    # coverage_count stays small and the coverage check below misses it.
+    projected_final_terminals = target_branches * subdivision_factor
     max_default_coverage_points = parse(Int, get(ENV, "VTS_MAX_COVERAGE_POINTS", string(RIGHT_LEG_50UM_MAX_DEFAULT_COVERAGE_POINTS)))
     allow_huge_coverage = parse_bool_arg(get(ENV, "VTS_ALLOW_HUGE_COVERAGE", "false"))
-    if coverage_count > max_default_coverage_points && !allow_huge_coverage
-        error("Requested coverage_count=$(coverage_count), which exceeds the safety limit $(max_default_coverage_points). " *
+    if (coverage_count > max_default_coverage_points || projected_final_terminals > max_default_coverage_points) && !allow_huge_coverage
+        error("Requested coverage_count=$(coverage_count), projected post-subdivision terminals=$(projected_final_terminals), exceeding the safety limit $(max_default_coverage_points). " *
               "For very large runs, pass an explicit target branch count or set VTS_MAX_COVERAGE_POINTS / VTS_ALLOW_HUGE_COVERAGE after confirming memory and disk budget. " *
-              "This guard prevents accidental 6um auto runs from allocating billions of target points.")
+              "This guard prevents accidental low-diameter auto runs from allocating billions of segments.")
     end
     progress_csv_path = joinpath(output_dir, "growth_progress.csv")
     target_demand_audit_csv = joinpath(output_dir, "xcat_right_leg_corrected_target_demand_audit.csv")
@@ -1087,7 +1081,7 @@ function main_right_leg_xcat_50um_gpu()
                 transition_diameter_cm=murray_transition_cm,
                 max_ld_ratio=subdivision_max_ld_ratio,
                 clip_below_diameter_cm=subdivision_clip_below_cm,
-                subdivide_xcat_terminals=subdivide_xcat_terminals,
+                skip_xcat=true,
                 domain=route_domain)
         elseif final_terminal_cm < growth_terminal_cm && terminal_bed_mode
             println("[terminal-bed] $(name): explicit routed terminal $(round(growth_terminal_cm * 1e4; digits=3)) um represents collapsed $(round(terminal_bed_diameter_um; digits=3)) um microvascular beds; no geometric subdivision applied")
@@ -1139,21 +1133,11 @@ function main_right_leg_xcat_50um_gpu()
         println("[export] skipped full arterial CSV; hemodynamic export remains enabled. Set VTS_EXPORT_FULL_ARTERIAL_CSV=true to write $(arterial_csv_path)")
     end
     write_hemodynamic_tree_csv(hemodynamic_csv_path, RIGHT_LEG_50UM_TREE_NAME, tree;
-        min_explicit_diameter_um=flow_explicit_min_diameter_um)
-    write_terminal_bed_audit_csv(terminal_bed_csv, RIGHT_LEG_50UM_TREE_NAME, tree;
-        bed_terminal_diameter_um=terminal_bed_diameter_um,
-        min_explicit_diameter_um=flow_explicit_min_diameter_um,
-        terminal_bed_length_cm=terminal_bed_length_cm,
-        gamma=distal_murray_gamma,
-        proximal_gamma=proximal_murray_gamma,
-        transition_diameter_cm=murray_transition_cm)
-    write_flow_topology_audit_csv(topology_audit_csv, RIGHT_LEG_50UM_TREE_NAME, tree;
-        min_diameter_um=topology_audit_min_diameter_um)
-    write_terminal_path_audit_csv(terminal_path_audit_csv, RIGHT_LEG_50UM_TREE_NAME, tree;
-        max_rows=terminal_path_audit_max_rows,
-        include_path_segments=terminal_path_audit_include_segments)
-    write_root_territory_audit_csv(root_territory_audit_csv, RIGHT_LEG_50UM_TREE_NAME, tree)
-    write_diameter_order_audit_csv(diameter_order_audit_csv, RIGHT_LEG_50UM_TREE_NAME, tree)
+        min_explicit_diameter_um=flow_explicit_min_diameter_um, viscosity_poise=blood_viscosity_poise)
+    write_flow_topology_audit_csv(topology_audit_csv, RIGHT_LEG_50UM_TREE_NAME, tree; viscosity_poise=blood_viscosity_poise)
+    write_terminal_path_audit_csv(terminal_path_audit_csv, RIGHT_LEG_50UM_TREE_NAME, tree; viscosity_poise=blood_viscosity_poise)
+    write_root_territory_audit_csv(root_territory_audit_csv, RIGHT_LEG_50UM_TREE_NAME, tree; viscosity_poise=blood_viscosity_poise)
+    write_diameter_order_audit_csv(diameter_order_audit_csv, RIGHT_LEG_50UM_TREE_NAME, tree; viscosity_poise=blood_viscosity_poise)
     write_xcat_seed_csv(xcat_fixed_csv, tree)
     write_xcat_paths_csv(nrb_artery_csv, fixed_artery_paths)
     write_xcat_paths_csv(nrb_vein_csv, vein_paths)
